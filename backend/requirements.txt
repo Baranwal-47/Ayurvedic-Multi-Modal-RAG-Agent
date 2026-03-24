@@ -1,0 +1,52 @@
+# -----------------------------
+# Core Backend
+# -----------------------------
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+pydantic
+sse-starlette
+
+# -----------------------------
+# Vector Database
+# -----------------------------
+qdrant-client
+
+# -----------------------------
+# LLM APIs
+# -----------------------------
+groq
+google-generativeai
+
+# -----------------------------
+# OCR
+# -----------------------------
+paddlepaddle
+paddleocr
+pytesseract
+
+# -----------------------------
+# PDF & Image Processing
+# -----------------------------
+pymupdf
+pdf2image
+Pillow
+opencv-python
+
+# -----------------------------
+# Text Processing
+# -----------------------------
+langdetect
+tiktoken
+
+# -----------------------------
+# Embeddings
+# -----------------------------
+sentence-transformers
+FlagEmbedding
+
+# -----------------------------
+# Document Processing
+# -----------------------------
+docling
