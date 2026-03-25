@@ -135,6 +135,16 @@ class Chunker:
 
 	def _detect_language(self, text: str) -> str:
 		script = self.normalizer.detect_script(text)
+		if script == "devanagari":
+			try:
+				lang = detect(text)
+				if lang == "hi":
+					return "hindi"
+				# langdetect is weak for Sanskrit; default Devanagari non-Hindi to Sanskrit.
+				return "sanskrit"
+			except Exception:
+				return "devanagari"
+
 		if script != "latin":
 			return script
 

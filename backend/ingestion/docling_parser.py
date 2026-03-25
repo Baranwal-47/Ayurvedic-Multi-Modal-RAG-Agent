@@ -21,7 +21,11 @@ class DoclingParser:
 			raise FileNotFoundError(f"PDF not found: {path}")
 
 		try:
-			return self._parse_with_docling(path)
+			blocks = self._parse_with_docling(path)
+			if blocks:
+				return blocks
+			print("[DoclingParser] WARNING: zero blocks extracted; using PyMuPDF fallback")
+			return self._parse_with_pymupdf(path)
 		except Exception as exc:
 			print(f"[DoclingParser] Docling parse failed ({exc}); using PyMuPDF fallback")
 			return self._parse_with_pymupdf(path)

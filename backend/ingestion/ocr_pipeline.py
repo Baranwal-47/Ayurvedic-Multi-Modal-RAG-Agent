@@ -91,10 +91,22 @@ class OCRPipeline:
 				)
 			page = doc.load_page(page_number - 1)
 			matrix = fitz.Matrix(2.0, 2.0)
-			pix = page.get_pixmap(matrix=matrix, alpha=False)
+			pix = page.get_pixmap(matrix=matrix, alpha=True)
 			arr = np.frombuffer(pix.samples, dtype=np.uint8)
-			rgb = arr.reshape(pix.height, pix.width, pix.n)
-			return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+			img = arr.reshape(pix.height, pix.width, pix.n)
+
+			# Handle common channel layouts from PyMuPDF robustly.
+			if pix.n == 4:
+				return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+			if pix.n == 3:
+				return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+			if pix.n == 1:
+				return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+			# Conservative fallback if uncommon channel count appears.
+			if img.shape[-1] > 3:
+				return cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2BGR)
+			return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
 	def _preprocess_image(self, image_bgr: np.ndarray) -> np.ndarray:
 		gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
