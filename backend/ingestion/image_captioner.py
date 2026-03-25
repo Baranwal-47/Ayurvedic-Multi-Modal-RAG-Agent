@@ -15,7 +15,7 @@ def build_image_caption(image_metadata: dict) -> str:
 		return figure_caption
 
 	nearest_heading = str(metadata.get("nearest_heading", "") or "").strip()
-	if nearest_heading:
+	if nearest_heading and not _is_generic_heading(nearest_heading):
 		return nearest_heading
 
 	surrounding_text = str(metadata.get("surrounding_text", "") or "").strip()
@@ -27,3 +27,17 @@ def build_image_caption(image_metadata: dict) -> str:
 		page_number = "unknown"
 
 	return f"Diagram from page {page_number}"
+
+
+def _is_generic_heading(text: str) -> bool:
+	compact = " ".join((text or "").split()).strip().lower()
+	if not compact:
+		return True
+
+	generic = {
+		"figure legends",
+		"figure legend",
+		"legends",
+		"figures",
+	}
+	return compact in generic
