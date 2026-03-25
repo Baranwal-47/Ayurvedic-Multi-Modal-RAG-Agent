@@ -208,7 +208,7 @@ class OCRPipeline:
 	def _detect_tesseract_langs(self, processed_img: np.ndarray) -> str:
 		default_lang = "san+hin+eng"
 		try:
-			osd = pytesseract.image_to_osd(processed_img)
+			osd = pytesseract.image_to_osd(processed_img, timeout=10)
 			osd_lower = osd.lower()
 
 			if "script: arabic" in osd_lower:
@@ -236,6 +236,7 @@ class OCRPipeline:
 				lang=lang,
 				output_type=pytesseract.Output.DICT,
 				config="--oem 1 --psm 6",
+				timeout=20,
 			)
 
 			text_chunks: list[str] = []
@@ -264,6 +265,7 @@ class OCRPipeline:
 					processed_img,
 					lang=lang,
 					config="--oem 1 --psm 6",
+					timeout=20,
 				).strip()
 
 			if not self._is_unicode_valid(text):

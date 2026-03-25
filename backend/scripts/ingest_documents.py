@@ -162,10 +162,17 @@ def run_ingestion(args: argparse.Namespace) -> dict[str, Any]:
 		b["text"] = str(b.get("text") or "")
 		b["normalized_text"] = normalizer.normalize(b["text"])
 
-	all_blocks = sorted(
-		[*parsed_blocks, *image_caption_blocks],
-		key=lambda b: (int(b.get("page_number") or 1), str(b.get("block_type") != "heading")),
-	)
+	ordered: list[tuple[int, int, dict[str, Any]]] = []
+	for idx, block in enumerate(parsed_blocks):
+		ordered.append((int(block.get("page_number") or 1), idx, block))
+
+	base_idx = len(parsed_blocks)
+	for j, block in enumerate(image_caption_blocks):
+		# Keep image captions at the end of each page while preserving parser block flow.
+		ordered.append((int(block.get("page_number") or 1), base_idx + j, block))
+
+	ordered.sort(key=lambda x: (x[0], x[1]))
+	all_blocks = [item[2] for item in ordered]
 
 	chunks = chunker.chunk(all_blocks)
 
