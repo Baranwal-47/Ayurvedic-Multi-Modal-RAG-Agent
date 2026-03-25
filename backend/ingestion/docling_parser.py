@@ -68,6 +68,7 @@ class DoclingParser:
 					"text": text,
 					"block_type": block_type,
 					"page_number": page_number,
+					"source_file": pdf_path.name,
 					"heading_context": heading_context,
 				}
 			)
@@ -102,6 +103,7 @@ class DoclingParser:
 							"text": text,
 							"block_type": block_type,
 							"page_number": page_idx,
+							"source_file": pdf_path.name,
 							"heading_context": heading_context,
 						}
 					)
