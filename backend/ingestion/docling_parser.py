@@ -79,33 +79,25 @@ class DoclingParser:
 
 	def is_text_garbled(self, text: str) -> bool:
 		"""Heuristic for broken glyph decoding from embedded non-Unicode PDF fonts."""
-		if not text:
+		if not text or len(text.strip()) < 5:
 			return False
 
-		joined = " ".join(text.split())
-		if len(joined) < 30:
+		total = len(text)
+		if total == 0:
 			return False
 
-		devanagari_count = sum(1 for ch in joined if 0x0900 <= ord(ch) <= 0x097F)
-		if devanagari_count > 0:
-			return False
+		weird = sum(1 for c in text if not c.isalnum() and c not in " \n")
+		devanagari = sum(1 for c in text if "\u0900" <= c <= "\u097F")
 
-		alpha_count = sum(1 for ch in joined if ch.isalpha())
-		if alpha_count < 15:
-			return False
+		# High symbol ratio usually indicates glyph decoding corruption.
+		if (weird / total) > 0.3:
+			return True
 
-		high_latin_count = sum(1 for ch in joined if ord(ch) > 127)
-		mojibake_hint_count = sum(1 for ch in joined if ch in self._MOJIBAKE_HINT_CHARS)
-		symbolic_noise_count = sum(
-			1
-			for ch in joined
-			if unicodedata.category(ch).startswith("S") and ch not in {"₹", "°"}
-		)
+		# Common mojibake remnants in legacy encoded Indic text.
+		if devanagari == 0 and any(x in text for x in ["É", "Ç", "Æ", "Ð", "ñ"]):
+			return True
 
-		high_latin_ratio = high_latin_count / max(alpha_count, 1)
-		noise_ratio = (mojibake_hint_count + symbolic_noise_count) / max(len(joined), 1)
-
-		return mojibake_hint_count >= 4 or high_latin_ratio > 0.35 or noise_ratio > 0.12
+		return False
 
 	def is_text_non_latin(self, text: str) -> bool:
 		"""Return True when text contains substantial non-Latin script letters."""

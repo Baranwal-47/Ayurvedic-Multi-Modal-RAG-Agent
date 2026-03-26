@@ -85,7 +85,13 @@ class OCRPipeline:
 	def __init__(self, paddle_langs: list[str] | None = None) -> None:
 		self.paddle_langs = paddle_langs or ["hi", "en"]
 
-	def process_page(self, pdf_path: str | Path, page_number: int) -> dict[str, Any]:
+	def process_page(
+		self,
+		pdf_path: str | Path,
+		page_number: int,
+		route_reason: str | None = None,
+		ocr_profile: str = "default",
+	) -> dict[str, Any]:
 		"""
 		Process a single PDF page and return:
 		{page_number, text, confidence, engine_used}
@@ -93,16 +99,30 @@ class OCRPipeline:
 		response: dict[str, Any] = {
 			"page_number": int(page_number),
 			"text": "",
+			"raw_text": "",
 			"confidence": 0.0,
-			"engine_used": "tesseract",
+			"engine_used": "paddleocr",
 		}
 
 		try:
-			page_image = self._pdf_page_to_image(pdf_path, page_number)
-			processed = self._preprocess_image(page_image)
+			dpi = 600 if ocr_profile == "garbled_table" else 300
+			page_image = self._pdf_page_to_image(pdf_path, page_number, dpi=dpi)
+			processed = self._preprocess_image(page_image, profile=ocr_profile)
 
 			paddle_text, paddle_conf = self._run_paddleocr(processed)
-			if paddle_text and paddle_conf >= 0.80 and self._is_unicode_valid(paddle_text):
+			response["raw_text"] = paddle_text
+			paddle_valid = bool(paddle_text) and self._is_unicode_valid(paddle_text)
+			if ocr_profile == "garbled_table" and paddle_text:
+				response.update(
+					{
+						"text": paddle_text,
+						"confidence": float(paddle_conf),
+						"engine_used": "paddleocr",
+					}
+				)
+				return response
+
+			if paddle_valid and (paddle_conf >= 0.80 or route_reason in {"scanned", "garbled", "non_latin"}):
 				response.update(
 					{
 						"text": paddle_text,
@@ -113,7 +133,39 @@ class OCRPipeline:
 				return response
 
 			tess_lang = self._detect_tesseract_langs(processed)
+			if tess_lang != "eng" and ocr_profile != "garbled_table":
+				if paddle_valid:
+					response.update(
+						{
+							"text": paddle_text,
+							"confidence": float(paddle_conf),
+							"engine_used": "paddleocr",
+						}
+					)
+				return response
+			if ocr_profile == "garbled_table" and tess_lang == "eng":
+				tess_lang = "san+hin+eng"
+
 			tess_text, tess_conf = self._run_tesseract(processed, tess_lang)
+			if ocr_profile == "garbled_table" and tess_text:
+				response.update(
+					{
+						"text": tess_text,
+						"confidence": float(tess_conf),
+						"engine_used": "tesseract",
+					}
+				)
+				return response
+
+			if paddle_valid and paddle_conf >= tess_conf:
+				response.update(
+					{
+						"text": paddle_text,
+						"confidence": float(paddle_conf),
+						"engine_used": "paddleocr",
+					}
+				)
+				return response
 
 			response.update(
 				{
@@ -128,7 +180,7 @@ class OCRPipeline:
 			print(f"[OCRPipeline] process_page failed on page {page_number}: {exc}")
 			return response
 
-	def _pdf_page_to_image(self, pdf_path: str | Path, page_number: int) -> np.ndarray:
+	def _pdf_page_to_image(self, pdf_path: str | Path, page_number: int, dpi: int = 300) -> np.ndarray:
 		path = Path(pdf_path)
 		if not path.exists():
 			raise FileNotFoundError(f"PDF not found: {path}")
@@ -138,7 +190,7 @@ class OCRPipeline:
 		try:
 			pil_pages = convert_from_path(
 				str(path),
-				dpi=300,
+				dpi=int(dpi),
 				first_page=page_number,
 				last_page=page_number,
 			)
@@ -173,7 +225,10 @@ class OCRPipeline:
 				return cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2BGR)
 			return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-	def _preprocess_image(self, image_bgr: np.ndarray) -> np.ndarray:
+	def _preprocess_image(self, image_bgr: np.ndarray, profile: str = "default") -> np.ndarray:
+		if profile == "garbled_table":
+			return self._preprocess_table_image(image_bgr)
+
 		gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 		denoised = cv2.GaussianBlur(gray, (5, 5), 0)
 		binary = cv2.adaptiveThreshold(
@@ -185,6 +240,55 @@ class OCRPipeline:
 			11,
 		)
 		return self._deskew(binary)
+
+	def _preprocess_table_image(self, image_bgr: np.ndarray) -> np.ndarray:
+		"""Table-friendly preprocessing to preserve fine glyphs and reduce gridline interference."""
+		gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+		# Upscale to improve OCR on tightly spaced transliteration tables.
+		height, width = gray.shape[:2]
+		scaled = cv2.resize(gray, (int(width * 1.5), int(height * 1.5)), interpolation=cv2.INTER_CUBIC)
+
+		clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+		enhanced = clahe.apply(scaled)
+
+		# Sharpen thin strokes before binarization.
+		sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+		sharpened = cv2.filter2D(enhanced, ddepth=-1, kernel=sharpen_kernel)
+
+		_, otsu = cv2.threshold(
+			sharpened,
+			0,
+			255,
+			cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+		)
+
+		binary = cv2.adaptiveThreshold(
+			sharpened,
+			255,
+			cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+			cv2.THRESH_BINARY,
+			31,
+			7,
+		)
+
+		# Blend adaptive and Otsu maps to keep both fine and strong strokes.
+		binary = cv2.bitwise_and(binary, otsu)
+		dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+		binary = cv2.dilate(binary, dilate_kernel, iterations=1)
+
+		# Remove strong table gridlines while keeping character strokes.
+		inv = 255 - binary
+		h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, scaled.shape[1] // 30), 1))
+		v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, scaled.shape[0] // 30)))
+		h_lines = cv2.morphologyEx(inv, cv2.MORPH_OPEN, h_kernel)
+		v_lines = cv2.morphologyEx(inv, cv2.MORPH_OPEN, v_kernel)
+		grid = cv2.bitwise_or(h_lines, v_lines)
+		inv_wo_grid = cv2.subtract(inv, grid)
+		clean = 255 - inv_wo_grid
+		clean = cv2.medianBlur(clean, 3)
+
+		return self._deskew(clean)
 
 	def _deskew(self, binary_img: np.ndarray) -> np.ndarray:
 		coords = np.column_stack(np.where(binary_img < 255))

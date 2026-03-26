@@ -12,7 +12,12 @@ import fitz
 class ImageExtractor:
 	"""Extract embedded PDF images and attach local textual context metadata."""
 
-	def extract(self, pdf_path: str | Path, output_dir: str | Path) -> list[dict[str, Any]]:
+	def extract(
+		self,
+		pdf_path: str | Path,
+		output_dir: str | Path,
+		scanned_pages: set[int] | None = None,
+	) -> list[dict[str, Any]]:
 		"""
 		Extract images from PDF and return metadata rows:
 		{image_path, page_number, source_file, surrounding_text, nearest_heading}
@@ -27,9 +32,12 @@ class ImageExtractor:
 		source_stem = path.stem
 		source_file = path.name
 		rows: list[dict[str, Any]] = []
+		scanned_page_set = set(scanned_pages or set())
 
 		with fitz.open(path) as doc:
 			for page_number, page in enumerate(doc, start=1):
+				page_width = float(page.rect.width or 0.0)
+				page_height = float(page.rect.height or 0.0)
 				text_blocks = self._extract_text_blocks(page)
 				heading_blocks = [b for b in text_blocks if self._looks_like_heading(b["text"])]
 
@@ -45,10 +53,6 @@ class ImageExtractor:
 					if figure_rect is None:
 						continue
 
-					image_name = f"{source_stem}_page{page_number}_figure{figure_index}.png"
-					image_path = out_dir / image_name
-					self._save_page_clip(page, figure_rect, image_path)
-
 					surrounding_text = self._get_surrounding_text(text_blocks, figure_rect)
 					nearest_heading = self._get_nearest_heading(heading_blocks, figure_rect)
 					explicit_caption = caption_by_group_index.get(figure_index - 1, "")
@@ -58,11 +62,49 @@ class ImageExtractor:
 						explicit_caption=explicit_caption,
 					)
 
+					area_ratio = self._compute_area_ratio(figure_rect, page_width, page_height)
+					is_full = self.is_full_page_image(figure_rect, page_width, page_height)
+					page_has_meaningful_text = self.has_meaningful_text(page_text)
+					is_scanned_page = page_number in scanned_page_set
+					has_caption = self.has_caption_nearby(text_blocks, figure_rect) or bool(str(resolved_caption or "").strip())
+					is_table_like = self.looks_like_table(
+						text_blocks=text_blocks,
+						image_bbox=figure_rect,
+						resolved_caption=resolved_caption,
+						surrounding_text=surrounding_text,
+					)
+					keep = self._should_keep_image_candidate(
+						is_full=is_full,
+						area_ratio=area_ratio,
+						has_caption=has_caption,
+						page_has_meaningful_text=page_has_meaningful_text,
+						is_table_like=is_table_like,
+						is_scanned_page=is_scanned_page,
+					)
+					print(
+						f"[IMAGE FILTER] page={page_number}, area_ratio={area_ratio:.2f}, "
+						f"full_page={is_full}, scanned_page={is_scanned_page}, kept={keep}"
+					)
+					if not keep:
+						continue
+
+					image_name = f"{source_stem}_page{page_number}_figure{figure_index}.png"
+					image_path = out_dir / image_name
+					self._save_page_clip(page, figure_rect, image_path)
+
+					if is_table_like:
+						content_type = "table"
+					elif is_full and not page_has_meaningful_text:
+						content_type = "figure"
+					else:
+						content_type = "figure"
+
 					rows.append(
 						{
 							"image_path": str(image_path),
 							"page_number": page_number,
 							"source_file": source_file,
+							"content_type": content_type,
 							"figure_caption": resolved_caption,
 							"surrounding_text": surrounding_text,
 							"nearest_heading": nearest_heading,
@@ -74,6 +116,98 @@ class ImageExtractor:
 					)
 
 		return rows
+
+	@staticmethod
+	def _compute_area_ratio(img_bbox: fitz.Rect, page_width: float, page_height: float) -> float:
+		if page_width <= 0 or page_height <= 0:
+			return 0.0
+
+		img_area = max(0.0, float(img_bbox.width)) * max(0.0, float(img_bbox.height))
+		page_area = page_width * page_height
+		if page_area <= 0:
+			return 0.0
+		return img_area / page_area
+
+	@staticmethod
+	def is_full_page_image(img_bbox: fitz.Rect, page_width: float, page_height: float) -> bool:
+		"""Return True when image occupies most of a page (likely scanned page background)."""
+		img_area = max(0.0, float(img_bbox.width)) * max(0.0, float(img_bbox.height))
+		page_area = max(0.0, page_width) * max(0.0, page_height)
+		if page_area <= 0:
+			return False
+		return (img_area / page_area) > 0.85
+
+	@staticmethod
+	def has_meaningful_text(page_text: str, min_chars: int = 50) -> bool:
+		"""Return True when parser-extracted page text is substantial."""
+		return len(str(page_text or "").strip()) > int(min_chars)
+
+	@staticmethod
+	def has_caption_nearby(blocks: list[dict[str, Any]], image_bbox: fitz.Rect) -> bool:
+		"""Return True when a likely caption appears immediately below/near an image."""
+		caption_text = ImageExtractor._extract_nearby_caption_text(blocks, image_bbox)
+		return bool(str(caption_text or "").strip())
+
+	@staticmethod
+	def looks_like_table(
+		text_blocks: list[dict[str, Any]],
+		image_bbox: fitz.Rect,
+		resolved_caption: str,
+		surrounding_text: str,
+	) -> bool:
+		"""Heuristic table detector from nearby text/caption cues."""
+		caption = str(resolved_caption or "").lower()
+		surround = str(surrounding_text or "").lower()
+		if "table" in caption or "table" in surround:
+			return True
+
+		near_caption = ImageExtractor._extract_nearby_caption_text(text_blocks, image_bbox).lower()
+		if "table" in near_caption:
+			return True
+
+		# Numeric-heavy nearby text often accompanies tabular figures.
+		num_ratio = 0.0
+		letters = sum(1 for c in surround if c.isalpha())
+		digits = sum(1 for c in surround if c.isdigit())
+		if letters + digits > 0:
+			num_ratio = digits / (letters + digits)
+		return num_ratio > 0.30 and len(surround.strip()) > 30
+
+	@staticmethod
+	def _should_keep_image_candidate(
+		is_full: bool,
+		area_ratio: float,
+		has_caption: bool,
+		page_has_meaningful_text: bool,
+		is_table_like: bool,
+		is_scanned_page: bool,
+	) -> bool:
+		"""
+		Classify image candidates to reduce scanned-page false positives.
+
+		Rules:
+		- Full-page images on pages already classified as scanned are ignored.
+		- Full-page images with meaningful page text are likely scanned backgrounds -> ignore.
+		- Full-page images with low page text can be true diagrams -> keep.
+		- Medium-large no-caption images are retained when table-like, else suppressed only if near-full-page.
+		- Smaller images are retained as figure candidates.
+		"""
+		if is_scanned_page and is_full:
+			return False
+
+		if is_full:
+			if page_has_meaningful_text:
+				return False
+			return True
+
+		if area_ratio >= 0.70 and not has_caption and not is_table_like:
+			return False
+
+		if area_ratio > 0.30 and not has_caption:
+			# Keep medium-size no-caption images to preserve table/diagram content.
+			return True
+
+		return True
 
 	@staticmethod
 	def _build_page_text(text_blocks: list[dict[str, Any]]) -> str:

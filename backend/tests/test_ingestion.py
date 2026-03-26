@@ -26,22 +26,30 @@ if str(ROOT) not in sys.path:
 
 # Start OCR warmup early so model load overlaps with non-OCR test sections.
 from ingestion.ocr_pipeline import warmup_ocr, wait_for_ocr_ready
+from ingestion.ocr_routing import apply_ocr_routing_to_document
 
+print("Before warmup")
 warmup_ocr()
+print("After warmup")
 print("[test_ingestion] OCR warming up in background...")
 
+# TEST_PDF_PATH = Path(os.getenv(
+#     "TEST_PDF_PATH",
+#     ROOT / "data" / "pdfs" / "Official Formularies & Pharmacopoea - PDF Format" / "AFI - PDF Format" /  "AFI PART - I" / "AFI-PART-I_PART_A_FORMULATIONS.pdf"
+# ))
 TEST_PDF_PATH = Path(os.getenv(
     "TEST_PDF_PATH",
-    ROOT / "data" / "pdfs" / "Official Formularies & Pharmacopoea - PDF Format" / "AFI - PDF Format" /  "AFI PART - I" / "AFI-PART-I_PART_A_FORMULATIONS.pdf"
+    ROOT / "data" / "pdfs" / "Official Formularies & Pharmacopoea - PDF Format" / "API - PDF Format" /  "API - Vol - I" / "Classical References" / "Slokas Vol 1.pdf"
 ))
 
 TEST_OUTPUT_ROOT = ROOT / "data" / "images" / "test_ingestion_test"
-TEST_USE_DOCLING = os.getenv("TEST_USE_DOCLING", "0").strip() in {"1", "true", "True"}
+# Default to production parity (Docling-first parser path) unless explicitly overridden.
+TEST_USE_DOCLING = os.getenv("TEST_USE_DOCLING", "1").strip() in {"1", "true", "True"}
 
 
 def get_effective_test_pdf_path(pdf_path: Path) -> Path:
-    """Use only first 15 pages for AFI-PART-I_PART_A_FORMULATIONS.pdf to keep test runtime manageable."""
-    if pdf_path.name.lower() != "afi-part-i_part_a_formulations.pdf":
+    """Use only first 15 pages for Slokas Vol 1.pdf to keep test runtime manageable."""
+    if pdf_path.name.lower() != "slokas vol 1.pdf":
         return pdf_path
 
     if not pdf_path.exists():
@@ -71,7 +79,7 @@ def get_effective_test_pdf_path(pdf_path: Path) -> Path:
                 dst.save(subset_pdf)
 
             print(
-                f"[test_ingestion] Limited AFI-PART-I_PART_A_FORMULATIONS to first 15 pages "
+                f"[test_ingestion] Limited Slokas Vol 1.pdf to first 15 pages "
                 f"({total_pages} -> 15): {subset_pdf}"
             )
             return subset_pdf
@@ -449,7 +457,9 @@ print("\n[5] OCRPipeline")
 
 try:
     from ingestion.ocr_pipeline import OCRPipeline
+    print("Before wait")
     wait_for_ocr_ready()
+    print("After wait")
     ocr = OCRPipeline()
     ok("import + model ready")
 except Exception as e:
@@ -523,6 +533,7 @@ print("\n[7] Ingestion Test Artifact")
 _can_run_e2e = (
     ACTIVE_TEST_PDF_PATH.exists()
     and parser is not None
+    and ocr is not None
     and chunker is not None
     and extractor is not None
     and build_image_caption is not None
@@ -535,9 +546,26 @@ if _can_run_e2e:
         pdf_root, images_dir, json_out = get_output_paths(TEST_PDF_PATH)
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        # Reuse cached results from sections 4 and 6 — no re-parsing
+        # Reuse cached parse output, then apply the same OCR routing as production.
         parsed_blocks = _cached_parsed_blocks
-        image_rows = _cached_image_rows
+        parsed_blocks, ocr_stats = apply_ocr_routing_to_document(
+            pdf_path=ACTIVE_TEST_PDF_PATH,
+            base_blocks=parsed_blocks,
+            parser=parser,
+            ocr=ocr,
+            force_ocr_all_pages=False,
+        )
+        ok(
+            "OCR routing applied via shared module "
+            f"(scanned={len(ocr_stats['scanned_pages'])}, garbled={len(ocr_stats['garbled_pages'])})"
+        )
+
+        # Re-extract with scanned-page awareness to mirror production image filtering.
+        image_rows = extractor.extract(
+            ACTIVE_TEST_PDF_PATH,
+            images_dir,
+            scanned_pages=set(ocr_stats.get("scanned_pages") or []),
+        )
 
         # Build image caption blocks
         image_caption_blocks = []
