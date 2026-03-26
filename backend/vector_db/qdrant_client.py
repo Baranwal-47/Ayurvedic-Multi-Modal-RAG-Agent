@@ -41,13 +41,14 @@ class QdrantManager:
     def __init__(self):
         url = os.getenv("QDRANT_URL")
         api_key = os.getenv("QDRANT_API_KEY")
+        timeout_sec = float(os.getenv("QDRANT_TIMEOUT_SEC", "120"))
 
         if not url:
             raise ValueError("QDRANT_URL not set in .env")
         if not api_key:
             raise ValueError("QDRANT_API_KEY not set in .env")
 
-        self.client = QdrantClient(url=url, api_key=api_key)
+        self.client = QdrantClient(url=url, api_key=api_key, timeout=timeout_sec)
         self.text_collection = TEXT_COLLECTION
         self.image_collection = IMAGE_COLLECTION
         self._collection_aliases = {
@@ -56,7 +57,7 @@ class QdrantManager:
             self.text_collection: self.text_collection,
             self.image_collection: self.image_collection,
         }
-        print(f"[QdrantManager] Connected to {url}")
+        print(f"[QdrantManager] Connected to {url} (timeout={timeout_sec}s)")
 
     # ------------------------------------------------------------------
     # Collection setup
