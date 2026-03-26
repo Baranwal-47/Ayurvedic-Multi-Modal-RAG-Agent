@@ -50,6 +50,12 @@ class QdrantManager:
         self.client = QdrantClient(url=url, api_key=api_key)
         self.text_collection = TEXT_COLLECTION
         self.image_collection = IMAGE_COLLECTION
+        self._collection_aliases = {
+            "text_chunks": self.text_collection,
+            "image_chunks": self.image_collection,
+            self.text_collection: self.text_collection,
+            self.image_collection: self.image_collection,
+        }
         print(f"[QdrantManager] Connected to {url}")
 
     # ------------------------------------------------------------------
@@ -262,10 +268,11 @@ class QdrantManager:
             except Exception as e:
                 print(f"[{name}] not found or error: {e}")
 
-    def delete_by_source(self, source_file: str):
+    def delete_by_source(self, source_file: str, collection: str | None = None) -> int:
         """
-        Delete all points from both collections that came from a specific PDF.
-        Useful for re-ingesting a single file without wiping everything.
+        Delete all points from a specific collection (or both collections when omitted)
+        where payload.source_file == source_file.
+        Returns the number of deleted points.
         """
         f = Filter(
             must=[
@@ -275,6 +282,33 @@ class QdrantManager:
                 )
             ]
         )
-        for collection in [TEXT_COLLECTION, IMAGE_COLLECTION]:
-            self.client.delete(collection_name=collection, points_selector=f)
-            print(f"[QdrantManager] Deleted points for '{source_file}' from {collection}")
+
+        if collection is not None:
+            collection_names = [self._resolve_collection_name(collection)]
+        else:
+            collection_names = [self.text_collection, self.image_collection]
+
+        total_deleted = 0
+        for col in collection_names:
+            try:
+                before = self.client.count(col, count_filter=f).count
+            except Exception:
+                before = 0
+
+            if before > 0:
+                self.client.delete(collection_name=col, points_selector=f)
+
+            print(f"[QdrantManager] Deleted points for '{source_file}' from {col}: {before}")
+            total_deleted += int(before)
+
+        return total_deleted
+
+    def _resolve_collection_name(self, collection: str) -> str:
+        name = str(collection or "").strip()
+        resolved = self._collection_aliases.get(name)
+        if not resolved:
+            raise ValueError(
+                f"Unknown collection '{collection}'. Expected one of: "
+                f"{self.text_collection}, {self.image_collection}, text_chunks, image_chunks"
+            )
+        return resolved
