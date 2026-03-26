@@ -19,7 +19,7 @@ from ingestion.chunker import Chunker
 from ingestion.docling_parser import DoclingParser
 from ingestion.image_captioner import build_image_caption
 from ingestion.image_extractor import ImageExtractor
-from ingestion.ocr_pipeline import OCRPipeline
+from ingestion.ocr_pipeline import OCRPipeline, warmup_ocr
 from normalization.diacritic_normalizer import DiacriticNormalizer
 
 
@@ -66,24 +66,47 @@ def _inject_ocr_for_scanned_pages(
 	parser: DoclingParser,
 	ocr: OCRPipeline,
 	force_ocr_all_pages: bool,
-) -> tuple[list[dict[str, Any]], list[int], Counter]:
+) -> tuple[list[dict[str, Any]], list[int], list[int], list[int], Counter, Counter]:
 	with fitz.open(pdf_path) as doc:
 		page_count = doc.page_count
 
 	grouped = _group_blocks_by_page(base_blocks)
 	scanned_pages: list[int] = []
+	garbled_pages: list[int] = []
+	non_latin_pages: list[int] = []
 	ocr_engine_counts: Counter = Counter()
+	ocr_reason_counts: Counter = Counter()
 	rebuilt: list[dict[str, Any]] = []
 
 	for page in range(1, page_count + 1):
 		page_blocks = grouped.get(page, [])
-		should_ocr = force_ocr_all_pages or parser.is_page_scanned(page_blocks)
+		is_scanned = parser.is_page_scanned(page_blocks)
+		is_garbled = parser.is_page_garbled(page_blocks)
+		is_non_latin = parser.is_page_non_latin(page_blocks)
+		should_ocr = force_ocr_all_pages or is_scanned or is_garbled or is_non_latin
 
 		if not should_ocr:
 			rebuilt.extend(page_blocks)
 			continue
 
-		scanned_pages.append(page)
+		reason = ""
+		if force_ocr_all_pages:
+			reason = "forced"
+		elif is_scanned:
+			reason = "scanned"
+		elif is_garbled:
+			reason = "garbled"
+		elif is_non_latin:
+			reason = "non_latin"
+		ocr_reason_counts[reason or "unknown"] += 1
+
+		if is_scanned:
+			scanned_pages.append(page)
+		if is_garbled:
+			garbled_pages.append(page)
+		if is_non_latin:
+			non_latin_pages.append(page)
+
 		ocr_result = ocr.process_page(pdf_path, page)
 		engine = str(ocr_result.get("engine_used") or "unknown")
 		ocr_engine_counts[engine] += 1
@@ -96,6 +119,15 @@ def _inject_ocr_for_scanned_pages(
 					heading_context = str(b.get("text", "")).strip()
 					break
 
+			if is_garbled and not is_scanned and not is_non_latin:
+				# Preserve cleaner blocks and replace only blocks likely affected by glyph-decoding corruption.
+				for b in page_blocks:
+					if not parser.is_text_garbled(str(b.get("text") or "")):
+						rebuilt.append(b)
+			else:
+				# Scanned/non-latin pages are represented by OCR text for consistent Unicode output.
+				pass
+
 			rebuilt.append(
 				{
 					"text": text,
@@ -105,8 +137,10 @@ def _inject_ocr_for_scanned_pages(
 					"heading_context": heading_context,
 				}
 			)
+		else:
+			rebuilt.extend(page_blocks)
 
-	return rebuilt, scanned_pages, ocr_engine_counts
+	return rebuilt, scanned_pages, garbled_pages, non_latin_pages, ocr_engine_counts, ocr_reason_counts
 
 
 def _build_image_caption_blocks(pdf_path: Path, image_output_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -134,6 +168,9 @@ def _build_image_caption_blocks(pdf_path: Path, image_output_dir: Path) -> tuple
 
 
 def run_ingestion(args: argparse.Namespace) -> dict[str, Any]:
+	# Warm OCR in background while parsing/other setup work runs.
+	warmup_ocr()
+
 	pdf_path = args.pdf
 	if not pdf_path.exists():
 		raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -147,7 +184,7 @@ def run_ingestion(args: argparse.Namespace) -> dict[str, Any]:
 	chunker = Chunker()
 
 	parsed_blocks = parser.parse(pdf_path)
-	parsed_blocks, scanned_pages, ocr_engine_counts = _inject_ocr_for_scanned_pages(
+	parsed_blocks, scanned_pages, garbled_pages, non_latin_pages, ocr_engine_counts, ocr_reason_counts = _inject_ocr_for_scanned_pages(
 		pdf_path=pdf_path,
 		base_blocks=parsed_blocks,
 		parser=parser,
@@ -192,7 +229,12 @@ def run_ingestion(args: argparse.Namespace) -> dict[str, Any]:
 		"images_extracted": len(images),
 		"scanned_pages_hit": len(scanned_pages),
 		"scanned_page_numbers": scanned_pages,
+		"garbled_pages_hit": len(garbled_pages),
+		"garbled_page_numbers": garbled_pages,
+		"non_latin_pages_hit": len(non_latin_pages),
+		"non_latin_page_numbers": non_latin_pages,
 		"ocr_engine_breakdown": dict(ocr_engine_counts),
+		"ocr_routing_breakdown": dict(ocr_reason_counts),
 		"source_file_all_chunks_ok": source_ok,
 		"chunk_count_reasonable": chunk_reasonable,
 	}

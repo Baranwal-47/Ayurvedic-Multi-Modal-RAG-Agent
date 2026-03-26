@@ -1,10 +1,46 @@
 """Normalization utilities for search-friendly text processing."""
 
+import re
 import unicodedata
 
 
 class DiacriticNormalizer:
     """Normalizes Indic diacritics for search while preserving source text elsewhere."""
+
+    # Safe cleanup for common OCR/typography artifacts seen in scanned PDFs.
+    _SAFE_CLEANUP_MAP = {
+        "\u00AD": "",   # soft hyphen
+        "\u200B": "",   # zero-width space
+        "\u200C": "",   # zero-width non-joiner
+        "\u200D": "",   # zero-width joiner
+        "\uFEFF": "",   # BOM
+        "\u00A0": " ",  # non-breaking space
+        "\u2019": "'",  # right single quote
+        "\u2018": "'",  # left single quote
+        "\u201C": '"',   # left double quote
+        "\u201D": '"',   # right double quote
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2026": "...",  # ellipsis
+        "ﬁ": "fi",
+        "ﬂ": "fl",
+        "ﬀ": "ff",
+        "ﬃ": "ffi",
+        "ﬄ": "ffl",
+        "ﬅ": "st",
+    }
+
+    # Multi-character transliteration patterns must run before single-char mapping.
+    _MULTI_CHAR_MAP = {
+        "ṭh": "th",
+        "Ṭh": "Th",
+        "ṭH": "tH",
+        "ṬH": "TH",
+        "ḍh": "dh",
+        "Ḍh": "Dh",
+        "ḍH": "dH",
+        "ḌH": "DH",
+    }
 
     _BASE_DIACRITIC_MAP = {
         "ā": "a",
@@ -39,14 +75,54 @@ class DiacriticNormalizer:
         **_UPPERCASE_DIACRITIC_MAP,
     }
 
-    _TRANSLATION_TABLE = str.maketrans(_DIACRITIC_MAP)
+    _OPTIONAL_LATIN_FOLD_MAP = {
+        "à": "a", "á": "a", "ä": "a", "ã": "a", "å": "a",
+        "è": "e", "é": "e", "ë": "e",
+        "ì": "i", "í": "i", "ï": "i",
+        "ò": "o", "ó": "o", "ö": "o", "õ": "o", "ø": "o",
+        "ù": "u", "ú": "u", "ü": "u",
+        "ý": "y", "ÿ": "y",
+        "ç": "c",
+        "ś": "s", "š": "s",
+        "ź": "z", "ž": "z", "ż": "z",
+        "ł": "l",
+        "À": "A", "Á": "A", "Ä": "A", "Ã": "A", "Å": "A",
+        "È": "E", "É": "E", "Ë": "E",
+        "Ì": "I", "Í": "I", "Ï": "I",
+        "Ò": "O", "Ó": "O", "Ö": "O", "Õ": "O", "Ø": "O",
+        "Ù": "U", "Ú": "U", "Ü": "U",
+        "Ç": "C",
+    }
 
-    def normalize(self, text: str) -> str:
-        """Return NFC-normalized text with configured diacritic replacements."""
+    _SAFE_CLEANUP_TABLE = str.maketrans(_SAFE_CLEANUP_MAP)
+    _TRANSLATION_TABLE = str.maketrans(_DIACRITIC_MAP)
+    _OPTIONAL_LATIN_FOLD_TABLE = str.maketrans(_OPTIONAL_LATIN_FOLD_MAP)
+
+    _MULTI_CHAR_REGEX = re.compile(
+        "|".join(sorted((re.escape(k) for k in _MULTI_CHAR_MAP.keys()), key=len, reverse=True))
+    )
+
+    def normalize(self, text: str, aggressive_latin_fold: bool = False) -> str:
+        """Return NFC-normalized text with search-friendly cleanup and diacritic replacements."""
         if not text:
             return ""
+
         nfc_text = unicodedata.normalize("NFC", text)
-        return nfc_text.translate(self._TRANSLATION_TABLE)
+        normalized = nfc_text.translate(self._SAFE_CLEANUP_TABLE)
+
+        normalized = self._MULTI_CHAR_REGEX.sub(
+            lambda m: self._MULTI_CHAR_MAP.get(m.group(0), m.group(0)),
+            normalized,
+        )
+
+        normalized = normalized.translate(self._TRANSLATION_TABLE)
+
+        if aggressive_latin_fold:
+            normalized = normalized.translate(self._OPTIONAL_LATIN_FOLD_TABLE)
+
+        # Remove OCR artifacts like "A \ rilal" while preserving regular punctuation.
+        normalized = re.sub(r"\s+\\\s+", " ", normalized)
+        return normalized
 
     def detect_script(self, text: str) -> str:
         """

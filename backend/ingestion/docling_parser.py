@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import unicodedata
 
 import fitz
 
 
 class DoclingParser:
 	"""Parse PDFs into normalized block dictionaries for downstream chunking."""
+
+	# Typical symbols seen when PDF glyph encodings are decoded without proper cmap.
+	_MOJIBAKE_HINT_CHARS = set("¶¤¦µ¿¡¢£¬÷×ØÐÞþðøåæçèéêëìíîïñòóôõöùúûüýÿ")
 
 	def parse(self, pdf_path: str | Path) -> list[dict[str, Any]]:
 		"""
@@ -40,6 +44,129 @@ class DoclingParser:
 		alnum_count = sum(ch.isalnum() for ch in joined)
 
 		return text_len < 40 or alnum_count < 20
+
+	def is_page_garbled(self, page_blocks: list[dict[str, Any]]) -> bool:
+		"""Return True when extracted text appears mojibake-garbled and OCR should be preferred."""
+		if not page_blocks:
+			return False
+
+		garbled_blocks = 0
+		substantial_blocks = 0
+		for block in page_blocks:
+			text = str(block.get("text") or "").strip()
+			if len(text) < 40:
+				continue
+			substantial_blocks += 1
+			if self.is_text_garbled(text):
+				garbled_blocks += 1
+
+		if substantial_blocks == 0:
+			return False
+
+		return garbled_blocks >= 1 and (garbled_blocks / substantial_blocks) >= 0.30
+
+	def is_page_non_latin(self, page_blocks: list[dict[str, Any]]) -> bool:
+		"""Return True when a page contains non-Latin text and should be OCR processed."""
+		if not page_blocks:
+			return False
+
+		for block in page_blocks:
+			text = str(block.get("text") or "").strip()
+			if self.is_text_non_latin(text):
+				return True
+
+		return False
+
+	def is_text_garbled(self, text: str) -> bool:
+		"""Heuristic for broken glyph decoding from embedded non-Unicode PDF fonts."""
+		if not text:
+			return False
+
+		joined = " ".join(text.split())
+		if len(joined) < 30:
+			return False
+
+		devanagari_count = sum(1 for ch in joined if 0x0900 <= ord(ch) <= 0x097F)
+		if devanagari_count > 0:
+			return False
+
+		alpha_count = sum(1 for ch in joined if ch.isalpha())
+		if alpha_count < 15:
+			return False
+
+		high_latin_count = sum(1 for ch in joined if ord(ch) > 127)
+		mojibake_hint_count = sum(1 for ch in joined if ch in self._MOJIBAKE_HINT_CHARS)
+		symbolic_noise_count = sum(
+			1
+			for ch in joined
+			if unicodedata.category(ch).startswith("S") and ch not in {"₹", "°"}
+		)
+
+		high_latin_ratio = high_latin_count / max(alpha_count, 1)
+		noise_ratio = (mojibake_hint_count + symbolic_noise_count) / max(len(joined), 1)
+
+		return mojibake_hint_count >= 4 or high_latin_ratio > 0.35 or noise_ratio > 0.12
+
+	def is_text_non_latin(self, text: str) -> bool:
+		"""Return True when text contains substantial non-Latin script letters."""
+		if not text:
+			return False
+
+		joined = " ".join(text.split())
+		if len(joined) < 5:
+			return False
+
+		letter_count = 0
+		non_latin_count = 0
+		for ch in joined:
+			if not ch.isalpha():
+				continue
+			letter_count += 1
+			if self._is_non_latin_script_char(ch):
+				non_latin_count += 1
+
+		if letter_count == 0:
+			return False
+
+		return (non_latin_count / letter_count) >= 0.20
+
+	@staticmethod
+	def _is_non_latin_script_char(ch: str) -> bool:
+		code = ord(ch)
+
+		# Indic blocks (Devanagari through Malayalam and additional Indic ranges)
+		if 0x0900 <= code <= 0x0DFF:
+			return True
+		if 0x1CD0 <= code <= 0x1CFF:
+			return True
+		if 0xA8E0 <= code <= 0xA8FF:
+			return True
+
+		# Arabic and related blocks
+		if 0x0600 <= code <= 0x06FF:
+			return True
+		if 0x0750 <= code <= 0x077F:
+			return True
+		if 0x08A0 <= code <= 0x08FF:
+			return True
+
+		# CJK + Japanese + Korean
+		if 0x4E00 <= code <= 0x9FFF:
+			return True
+		if 0x3040 <= code <= 0x30FF:
+			return True
+		if 0xAC00 <= code <= 0xD7AF:
+			return True
+
+		# Greek, Cyrillic, Hebrew
+		if 0x0370 <= code <= 0x03FF:
+			return True
+		if 0x0400 <= code <= 0x04FF:
+			return True
+		if 0x0590 <= code <= 0x05FF:
+			return True
+
+		return False
 
 	def _parse_with_docling(self, pdf_path: Path) -> list[dict[str, Any]]:
 		from docling.document_converter import DocumentConverter

@@ -18,16 +18,66 @@ import os
 import sys
 from pathlib import Path
 
+import fitz
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Start OCR warmup early so model load overlaps with non-OCR test sections.
+from ingestion.ocr_pipeline import warmup_ocr, wait_for_ocr_ready
+
+warmup_ocr()
+print("[test_ingestion] OCR warming up in background...")
+
 TEST_PDF_PATH = Path(os.getenv(
     "TEST_PDF_PATH",
-    ROOT / "data" / "pdfs" / "HPTLC Finger Print Atlas of Medicinal Plants.pdf"
+    ROOT / "data" / "pdfs" / "Official Formularies & Pharmacopoea - PDF Format" / "AFI - PDF Format" /  "AFI PART - I" / "AFI-PART-I_PART_A_FORMULATIONS.pdf"
 ))
 
 TEST_OUTPUT_ROOT = ROOT / "data" / "images" / "test_ingestion_test"
+TEST_USE_DOCLING = os.getenv("TEST_USE_DOCLING", "0").strip() in {"1", "true", "True"}
+
+
+def get_effective_test_pdf_path(pdf_path: Path) -> Path:
+    """Use only first 15 pages for AFI-PART-I_PART_A_FORMULATIONS.pdf to keep test runtime manageable."""
+    if pdf_path.name.lower() != "afi-part-i_part_a_formulations.pdf":
+        return pdf_path
+
+    if not pdf_path.exists():
+        return pdf_path
+
+    tmp_dir = TEST_OUTPUT_ROOT / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    subset_pdf = tmp_dir / pdf_path.name
+
+    try:
+        with fitz.open(pdf_path) as src:
+            total_pages = src.page_count
+            if total_pages <= 15:
+                return pdf_path
+
+            if subset_pdf.exists():
+                try:
+                    with fitz.open(subset_pdf) as cached:
+                        if cached.page_count == 15:
+                            print(f"[test_ingestion] Using cached 15-page subset: {subset_pdf}")
+                            return subset_pdf
+                except Exception:
+                    pass
+
+            with fitz.open() as dst:
+                dst.insert_pdf(src, from_page=0, to_page=14)
+                dst.save(subset_pdf)
+
+            print(
+                f"[test_ingestion] Limited AFI-PART-I_PART_A_FORMULATIONS to first 15 pages "
+                f"({total_pages} -> 15): {subset_pdf}"
+            )
+            return subset_pdf
+    except Exception as exc:
+        print(f"[test_ingestion] WARN: could not create 15-page subset ({exc}); using full PDF")
+        return pdf_path
 
 
 def get_output_paths(pdf_path: Path) -> tuple[Path, Path, Path]:
@@ -41,6 +91,8 @@ def get_output_paths(pdf_path: Path) -> tuple[Path, Path, Path]:
 
 passed = 0
 failed = 0
+
+ACTIVE_TEST_PDF_PATH = get_effective_test_pdf_path(TEST_PDF_PATH)
 
 # Caches — populated in sections 4 and 6, reused in section 7
 _cached_parsed_blocks: list | None = None
@@ -323,9 +375,56 @@ if parser:
     except Exception as e:
         fail("is_page_scanned: tiny text", e)
 
-    if TEST_PDF_PATH.exists():
+    try:
+        assert parser.is_text_non_latin("नमस्ते पित्तं वाता") is True
+        ok("is_text_non_latin: Devanagari text → True")
+    except Exception as e:
+        fail("is_text_non_latin: Devanagari text", e)
+
+    try:
+        assert parser.is_text_non_latin("This is clean English text") is False
+        ok("is_text_non_latin: English text → False")
+    except Exception as e:
+        fail("is_text_non_latin: English text", e)
+
+    try:
+        blocks = [{"text": "अ आ इ ई उ ऊ ऋ"}]
+        assert parser.is_page_non_latin(blocks) is True
+        ok("is_page_non_latin: Indic page → True")
+    except Exception as e:
+        fail("is_page_non_latin: Indic page", e)
+
+    try:
+        blocks = [{"text": "This page is fully English language content."}]
+        assert parser.is_page_non_latin(blocks) is False
+        ok("is_page_non_latin: English page → False")
+    except Exception as e:
+        fail("is_page_non_latin: English page", e)
+
+    try:
+        sample = "¶¤¦µ¿¡¢£¬÷×ØÐÞþðøåæçèéêëìíîïñòóôõöùúûüýÿ" * 3
+        assert parser.is_text_garbled(sample) is True
+        ok("is_text_garbled: mojibake sample → True")
+    except Exception as e:
+        fail("is_text_garbled: mojibake sample", e)
+
+    try:
+        sample = "The quick brown fox jumps over the lazy dog repeatedly."
+        assert parser.is_text_garbled(sample) is False
+        ok("is_text_garbled: clean English sample → False")
+    except Exception as e:
+        fail("is_text_garbled: clean English sample", e)
+
+    if ACTIVE_TEST_PDF_PATH.exists():
         try:
-            blocks = parser.parse(TEST_PDF_PATH)
+            if TEST_USE_DOCLING:
+                blocks = parser.parse(ACTIVE_TEST_PDF_PATH)
+                backend = "docling"
+            else:
+                # Default to PyMuPDF in tests to avoid long model initialization/download waits.
+                blocks = parser._parse_with_pymupdf(ACTIVE_TEST_PDF_PATH)
+                backend = "pymupdf"
+
             assert isinstance(blocks, list), "parse must return a list"
             assert len(blocks) > 0, "got zero blocks — check _extract_docling_text"
             for b in blocks[:3]:
@@ -334,13 +433,13 @@ if parser:
                 assert "page_number" in b
                 assert "source_file" in b
                 assert b["source_file"] == TEST_PDF_PATH.name
-            ok(f"parse real PDF → {len(blocks)} blocks, schema OK")
+            ok(f"parse real PDF ({backend}) → {len(blocks)} blocks, schema OK")
             # Cache for section 7 — no re-parsing needed
             _cached_parsed_blocks = blocks
         except Exception as e:
             fail("parse real PDF", e)
     else:
-        print(f"  SKIP  parse real PDF — PDF not found at: {TEST_PDF_PATH}")
+        print(f"  SKIP  parse real PDF — PDF not found at: {ACTIVE_TEST_PDF_PATH}")
 
 
 # ─────────────────────────────────────────────
@@ -350,15 +449,16 @@ print("\n[5] OCRPipeline")
 
 try:
     from ingestion.ocr_pipeline import OCRPipeline
+    wait_for_ocr_ready()
     ocr = OCRPipeline()
-    ok("import")
+    ok("import + model ready")
 except Exception as e:
     fail("import", e)
     ocr = None
 
-if ocr and TEST_PDF_PATH.exists():
+if ocr and ACTIVE_TEST_PDF_PATH.exists():
     try:
-        result = ocr.process_page(TEST_PDF_PATH, 1)
+        result = ocr.process_page(ACTIVE_TEST_PDF_PATH, 1)
         assert "text" in result
         assert "confidence" in result
         assert "engine_used" in result
@@ -386,12 +486,12 @@ except Exception as e:
     fail("import", e)
     extractor = None
 
-if extractor and TEST_PDF_PATH.exists():
+if extractor and ACTIVE_TEST_PDF_PATH.exists():
     try:
         pdf_root, images_dir, _ = get_output_paths(TEST_PDF_PATH)
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        images = extractor.extract(TEST_PDF_PATH, images_dir)
+        images = extractor.extract(ACTIVE_TEST_PDF_PATH, images_dir)
         assert isinstance(images, list)
         for img in images:
             assert "image_path" in img
@@ -421,7 +521,7 @@ elif extractor:
 print("\n[7] Ingestion Test Artifact")
 
 _can_run_e2e = (
-    TEST_PDF_PATH.exists()
+    ACTIVE_TEST_PDF_PATH.exists()
     and parser is not None
     and chunker is not None
     and extractor is not None
@@ -500,9 +600,8 @@ if _can_run_e2e:
 
     except Exception as e:
         fail("end-to-end artifact", e)
-
-elif not TEST_PDF_PATH.exists():
-    print(f"  SKIP  end-to-end — PDF not found at: {TEST_PDF_PATH}")
+elif not ACTIVE_TEST_PDF_PATH.exists():
+    print(f"  SKIP  end-to-end — PDF not found at: {ACTIVE_TEST_PDF_PATH}")
 else:
     missing = []
     if _cached_parsed_blocks is None:
@@ -521,7 +620,7 @@ print("=" * 50)
 
 if failed == 0:
     print("\nAll ingestion tests passed.")
-    if TEST_PDF_PATH.exists():
+    if ACTIVE_TEST_PDF_PATH.exists():
         _, images_dir, json_out = get_output_paths(TEST_PDF_PATH)
         print("\nOutput files to inspect:")
         print(f"  chunks + metadata  →  {json_out}")

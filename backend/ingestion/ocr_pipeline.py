@@ -2,15 +2,81 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import cv2
 import fitz
 import numpy as np
 import pytesseract
-from paddleocr import PaddleOCR
 from pdf2image import convert_from_path
+
+if TYPE_CHECKING:
+	from paddleocr import PaddleOCR
+
+
+_PADDLE_SINGLETON: Any | None = None
+_PADDLE_LOCK = threading.Lock()
+_PADDLE_WARMUP_THREAD: threading.Thread | None = None
+
+
+def _load_paddle_model() -> None:
+	"""Load PaddleOCR once per process in a thread-safe manner."""
+	global _PADDLE_SINGLETON
+	with _PADDLE_LOCK:
+		if _PADDLE_SINGLETON is not None:
+			return
+
+		print("[OCRPipeline] Loading PaddleOCR model into memory...")
+		try:
+			from paddleocr import PaddleOCR
+
+			_PADDLE_SINGLETON = PaddleOCR(use_angle_cls=True, lang="hi")
+		except Exception:
+			from paddleocr import PaddleOCR
+
+			_PADDLE_SINGLETON = PaddleOCR(use_angle_cls=True, lang="en")
+		print("[OCRPipeline] PaddleOCR model ready.")
+
+
+def warmup_ocr() -> None:
+	"""Start asynchronous OCR model warmup; safe to call repeatedly."""
+	global _PADDLE_WARMUP_THREAD
+	if _PADDLE_SINGLETON is not None:
+		return
+	if _PADDLE_WARMUP_THREAD is not None and _PADDLE_WARMUP_THREAD.is_alive():
+		return
+
+	_PADDLE_WARMUP_THREAD = threading.Thread(
+		target=_load_paddle_model,
+		daemon=True,
+		name="paddle-warmup",
+	)
+	_PADDLE_WARMUP_THREAD.start()
+	print("[OCRPipeline] PaddleOCR warming up in background thread...")
+
+
+def wait_for_ocr_ready() -> None:
+	"""Block until OCR warmup is complete; loads synchronously if needed."""
+	if _PADDLE_SINGLETON is not None:
+		return
+	if _PADDLE_WARMUP_THREAD is not None:
+		_PADDLE_WARMUP_THREAD.join()
+		return
+	_load_paddle_model()
+
+
+def _get_paddle() -> Any:
+	"""Return the singleton OCR model, waiting for warmup if necessary."""
+	if _PADDLE_SINGLETON is not None:
+		return _PADDLE_SINGLETON
+	wait_for_ocr_ready()
+	return _PADDLE_SINGLETON
+
+
+# Begin model loading early so first OCR call usually avoids cold start.
+warmup_ocr()
 
 
 class OCRPipeline:
@@ -18,7 +84,6 @@ class OCRPipeline:
 
 	def __init__(self, paddle_langs: list[str] | None = None) -> None:
 		self.paddle_langs = paddle_langs or ["hi", "en"]
-		self._paddle_model: PaddleOCR | None = None
 
 	def process_page(self, pdf_path: str | Path, page_number: int) -> dict[str, Any]:
 		"""
@@ -143,18 +208,8 @@ class OCRPipeline:
 			borderMode=cv2.BORDER_REPLICATE,
 		)
 
-	def _get_paddle(self) -> PaddleOCR:
-		if self._paddle_model is None:
-			# PaddleOCR accepts a single language model; use Hindi model for Devanagari-first pages.
-			# If unavailable in local setup, it falls back to English model.
-			try:
-				self._paddle_model = PaddleOCR(use_angle_cls=True, lang="hi")
-			except Exception:
-				self._paddle_model = PaddleOCR(use_angle_cls=True, lang="en")
-		return self._paddle_model
-
 	def _run_paddleocr(self, processed_img: np.ndarray) -> tuple[str, float]:
-		model = self._get_paddle()
+		model = _get_paddle()
 		result = None
 
 		# PaddleOCR API differs across versions; try common call signatures.
