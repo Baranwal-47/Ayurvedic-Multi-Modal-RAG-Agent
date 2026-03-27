@@ -128,8 +128,14 @@ def _build_image_caption_blocks(
     pdf_path: Path,
     image_output_dir: Path,
     scanned_pages: set[int] | None = None,
+    page_blocks: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    images = ImageExtractor().extract(pdf_path, image_output_dir, scanned_pages=scanned_pages)
+    images = ImageExtractor().extract(
+        pdf_path,
+        image_output_dir,
+        scanned_pages=scanned_pages,
+        page_blocks=page_blocks,
+    )
     caption_blocks: list[dict[str, Any]] = []
 
     for row in images:
@@ -187,6 +193,7 @@ def _run_pipeline_for_pdf(pdf_path: Path, image_output_dir: Path) -> tuple[list[
         pdf_path=pdf_path,
         image_output_dir=image_output_dir,
         scanned_pages=set(ocr_stats.get("scanned_pages") or []),
+        page_blocks=parsed_blocks,
     )
     _log(
         f"[PIPELINE] Images extracted: {len(images)}, caption blocks: {len(image_caption_blocks)} "

@@ -142,7 +142,7 @@ class DoclingParser:
 		return garbled_blocks >= 1 and (garbled_blocks / substantial_blocks) >= 0.30
 
 	def is_page_non_latin(self, page_blocks: list[dict[str, Any]]) -> bool:
-		"""Return True when a page contains non-Latin text and should be OCR processed."""
+		"""Return True when a page contains substantial non-Latin text for reporting/analysis."""
 		if not page_blocks:
 			return False
 

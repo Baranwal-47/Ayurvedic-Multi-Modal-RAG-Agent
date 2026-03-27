@@ -36,13 +36,39 @@ def _combined_page_text(page_blocks: list[dict[str, Any]]) -> str:
 	return "\n".join(p for p in parts if p)
 
 
-def should_apply_ocr(page_blocks: list[dict[str, Any]], page_text: str, parser: Any) -> bool:
-	"""Decide OCR usage using scanned/garbled signals only."""
-	if parser.is_page_scanned(page_blocks):
-		return True
-	if parser.is_text_garbled(page_text):
-		return True
-	return False
+def _largest_image_ratio_for_page(pdf_path: Path, page_number: int) -> float:
+	"""Return max image area ratio on a page using embedded image placement metadata."""
+	try:
+		with fitz.open(pdf_path) as doc:
+			if page_number < 1 or page_number > doc.page_count:
+				return 0.0
+			page = doc.load_page(page_number - 1)
+			page_area = max(1.0, float(page.rect.width) * float(page.rect.height))
+			largest = 0.0
+			for info in page.get_image_info(xrefs=True):
+				bbox = info.get("bbox")
+				if not bbox:
+					continue
+				rect = fitz.Rect(bbox)
+				area = max(0.0, float(rect.width)) * max(0.0, float(rect.height))
+				largest = max(largest, area / page_area)
+			return float(largest)
+	except Exception:
+		return 0.0
+
+
+def detect_scanned_page(
+	blocks: list[dict[str, Any]],
+	largest_image_ratio: float,
+	used_scanned_fallback: bool,
+) -> bool:
+	"""Robust scanned-page detection combining text, image coverage, and fallback usage signals."""
+	text_len = sum(len(str((b or {}).get("text") or "")) for b in blocks)
+	return bool(
+		text_len < 50
+		or float(largest_image_ratio) > 0.8
+		or bool(used_scanned_fallback)
+	)
 
 
 def _is_garbled_table_candidate(page_blocks: list[dict[str, Any]], parser: Any) -> bool:
@@ -66,21 +92,34 @@ def _is_garbled_table_candidate(page_blocks: list[dict[str, Any]], parser: Any) 
 	return garbled_count >= 1 and pipe_count >= 1
 
 
-def classify_page_for_ocr(page_number: int, page_blocks: list[dict[str, Any]], parser: Any) -> OCRRoutingDecision:
+def classify_page_for_ocr(
+	page_number: int,
+	page_blocks: list[dict[str, Any]],
+	parser: Any,
+	pdf_path: Path,
+	used_scanned_fallback: bool = False,
+) -> OCRRoutingDecision:
 	"""Classify a page and emit structured OCR routing logs."""
 	page_text = _combined_page_text(page_blocks)
-	scanned = parser.is_page_scanned(page_blocks)
-	garbled = parser.is_text_garbled(page_text)
+	largest_image_ratio = _largest_image_ratio_for_page(pdf_path, page_number)
+	scanned = detect_scanned_page(page_blocks, largest_image_ratio, used_scanned_fallback)
+	garbled = parser.is_page_garbled(page_blocks)
 	non_latin = parser.is_page_non_latin(page_blocks)
-	use_ocr = should_apply_ocr(page_blocks, page_text, parser)
+	# Deterministic routing:
+	# - scanned pages always use OCR
+	# - digitized pages only use OCR when parser text is clearly garbled
+	use_ocr = bool(scanned or garbled)
 
 	reason = "none"
-	if use_ocr:
-		reason = "scanned" if scanned else "garbled"
+	if scanned:
+		reason = "scanned"
+	elif garbled:
+		reason = "garbled"
 
 	print(
 		f"[OCR ROUTING] page={page_number}, scanned={scanned}, garbled={garbled}, "
-		f"non_latin={non_latin}, use_ocr={use_ocr}"
+		f"non_latin={non_latin}, image_ratio={largest_image_ratio:.3f}, "
+		f"fallback_scanned={bool(used_scanned_fallback)}, use_ocr={use_ocr}"
 	)
 
 	return OCRRoutingDecision(
@@ -242,7 +281,7 @@ def apply_ocr_routing_to_document(
 
 		for page in range(batch_start, batch_end + 1):
 			page_blocks = grouped.get(page, [])
-			decision = classify_page_for_ocr(page, page_blocks, parser)
+			decision = classify_page_for_ocr(page, page_blocks, parser, path)
 			use_ocr = bool(force_ocr_all_pages) or decision.use_ocr
 			reason = "forced" if force_ocr_all_pages else decision.reason
 
@@ -258,11 +297,13 @@ def apply_ocr_routing_to_document(
 				continue
 
 			ocr_reason_counts[reason or "unknown"] += 1
-			ocr_profile = "default"
-			if reason == "garbled" and _is_garbled_table_candidate(page_blocks, parser):
-				ocr_profile = "garbled_table"
+			ocr_profile = "garbled_table" if (decision.garbled and _is_garbled_table_candidate(page_blocks, parser)) else "default"
 			ocr_result = ocr.process_page(path, page, route_reason=reason, ocr_profile=ocr_profile)
 			engine = str((ocr_result or {}).get("engine_used") or "unknown")
+			print(
+				f"[OCR ENGINE] page={page}, scanned_page={decision.scanned}, "
+				f"garbled_page={decision.garbled}, reason={reason}, profile={ocr_profile}, engine={engine}"
+			)
 			ocr_engine_counts[engine] += 1
 
 			updated = attach_ocr_to_blocks(

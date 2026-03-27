@@ -19,6 +19,7 @@ import fitz
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from ingestion.docling_parser import DoclingParser
+from ingestion.ocr_routing import classify_page_for_ocr
 
 REQUIRED_KEYS = {"text", "block_type", "page_number", "heading_context"}
 ALLOWED_TYPES = {"paragraph", "heading", "table", "figure_caption"}
@@ -62,7 +63,13 @@ def summarize_pdf(pdf_path: Path, parser: DoclingParser) -> dict[str, Any]:
         page_blocks = by_page.get(page_no, [])
         if not page_blocks:
             pages_with_no_blocks.append(page_no)
-        if parser.is_page_scanned(page_blocks):
+        decision = classify_page_for_ocr(
+            page_number=page_no,
+            page_blocks=page_blocks,
+            parser=parser,
+            pdf_path=pdf_path,
+        )
+        if decision.scanned:
             pages_flagged_scanned.append(page_no)
 
     if pages_with_no_blocks:

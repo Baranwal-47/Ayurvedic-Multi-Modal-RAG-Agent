@@ -4,29 +4,33 @@ from __future__ import annotations
 
 
 def build_image_caption(image_metadata: dict) -> str:
-	"""
-	Build a searchable caption from image metadata using priority:
-	figure_caption -> nearest_heading -> surrounding_text[:300] -> Diagram from page {N}
-	"""
 	metadata = image_metadata or {}
 
 	figure_caption = str(metadata.get("figure_caption", "") or "").strip()
-	if figure_caption:
-		return figure_caption
-
 	nearest_heading = str(metadata.get("nearest_heading", "") or "").strip()
-	if nearest_heading and not _is_generic_heading(nearest_heading):
-		return nearest_heading
-
 	surrounding_text = str(metadata.get("surrounding_text", "") or "").strip()
-	if surrounding_text:
-		return surrounding_text[:300]
-
 	page_number = metadata.get("page_number")
-	if page_number is None or str(page_number).strip() == "":
-		page_number = "unknown"
 
-	return f"Diagram from page {page_number}"
+	parts = []
+
+	# 1. Strong signal
+	if figure_caption:
+			parts.append(figure_caption)
+
+	# 2. VERY IMPORTANT (always include if useful)
+	if nearest_heading and not _is_generic_heading(nearest_heading):
+			parts.append(nearest_heading)
+			parts.append(f"diagram of {nearest_heading}")
+
+	# 3. Context
+	if surrounding_text:
+			parts.append(surrounding_text[:150])
+
+	# 4. Fallback
+	if not parts:
+			parts.append(f"Diagram from page {page_number or 'unknown'}")
+
+	return " | ".join(parts)
 
 
 def _is_generic_heading(text: str) -> bool:

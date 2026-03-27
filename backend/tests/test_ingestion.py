@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 # Start OCR warmup early so model load overlaps with non-OCR test sections.
 from ingestion.ocr_pipeline import warmup_ocr, wait_for_ocr_ready
-from ingestion.ocr_routing import apply_ocr_routing_to_document
+from ingestion.ocr_routing import apply_ocr_routing_to_document, classify_page_for_ocr
 
 print("Before warmup")
 warmup_ocr()
@@ -145,6 +145,7 @@ passed = 0
 failed = 0
 
 ACTIVE_TEST_PDF_PATH = get_effective_test_pdf_path(TEST_PDF_PATH)
+ACTIVE_SOURCE_FILE = ACTIVE_TEST_PDF_PATH.name
 
 # Caches — populated in sections 4 and 6, reused in section 7
 _cached_parsed_blocks: list | None = None
@@ -368,7 +369,7 @@ if build_image_caption:
             "nearest_heading": "Panchakarma Procedures",
             "surrounding_text": "This diagram shows the five cleansing procedures",
         })
-        assert result == "Panchakarma Procedures"
+        assert "Panchakarma Procedures" in result
         ok("nearest_heading used when no figure_caption")
     except Exception as e:
         fail("nearest_heading fallback", e)
@@ -467,6 +468,30 @@ if parser:
     except Exception as e:
         fail("is_text_garbled: clean English sample", e)
 
+    try:
+        garbled_blocks = [
+            {
+                "text": "Â¶Â¤Â¦ÂµÂ¿Â¡Â¢Â£Â¬Ã·Ã—Ã˜ÃÃžÃ¾Ã°Ã¸Ã¥Ã¦Ã§Ã¨Ã©ÃªÃ«Ã¬Ã­Ã®Ã¯Ã±Ã²Ã³Ã´ÃµÃ¶Ã¹ÃºÃ»Ã¼Ã½Ã¿" * 2,
+                "block_type": "paragraph",
+                "page_number": 1,
+                "source_file": "test.pdf",
+                "heading_context": "",
+            }
+        ]
+        decision = classify_page_for_ocr(
+            page_number=1,
+            page_blocks=garbled_blocks,
+            parser=parser,
+            pdf_path=Path(__file__),
+        )
+        assert decision.scanned is False
+        assert decision.garbled is True
+        assert decision.use_ocr is True
+        assert decision.reason == "garbled"
+        ok("garbled digitized page routes to OCR")
+    except Exception as e:
+        fail("garbled digitized page routes to OCR", e)
+
     if ACTIVE_TEST_PDF_PATH.exists():
         try:
             if TEST_USE_DOCLING:
@@ -484,7 +509,7 @@ if parser:
                 assert "block_type" in b
                 assert "page_number" in b
                 assert "source_file" in b
-                assert b["source_file"] == TEST_PDF_PATH.name
+                assert b["source_file"] == ACTIVE_SOURCE_FILE
             ok(f"parse real PDF ({backend}) → {len(blocks)} blocks, schema OK")
             # Cache for section 7 — no re-parsing needed
             _cached_parsed_blocks = blocks
@@ -512,13 +537,15 @@ except Exception as e:
 
 if ocr and ACTIVE_TEST_PDF_PATH.exists():
     try:
-        result = ocr.process_page(ACTIVE_TEST_PDF_PATH, 1)
+        # The production pipeline only invokes OCR on pages explicitly routed as scanned/forced.
+        result = ocr.process_page(ACTIVE_TEST_PDF_PATH, 1, route_reason="forced")
         assert "text" in result
+        assert "raw_text" in result
         assert "confidence" in result
         assert "engine_used" in result
         assert "page_number" in result
         assert result["page_number"] == 1
-        assert result["engine_used"] in ("paddleocr", "tesseract", "indic-ocr")
+        assert result["engine_used"] in ("paddleocr", "tesseract")
         assert isinstance(result["confidence"], float)
         ok(f"process_page 1 → engine={result['engine_used']} conf={result['confidence']:.2f} text_len={len(result['text'])}")
     except Exception as e:
@@ -609,6 +636,7 @@ if _can_run_e2e:
             ACTIVE_TEST_PDF_PATH,
             images_dir,
             scanned_pages=set(ocr_stats.get("scanned_pages") or []),
+            page_blocks=parsed_blocks,
         )
 
         # Build image caption blocks
@@ -622,7 +650,7 @@ if _can_run_e2e:
                     "text": caption,
                     "block_type": "figure_caption",
                     "page_number": int(row.get("page_number") or 1),
-                    "source_file": TEST_PDF_PATH.name,
+                    "source_file": ACTIVE_SOURCE_FILE,
                     "heading_context": str(row.get("nearest_heading") or ""),
                 }
             )
@@ -634,13 +662,13 @@ if _can_run_e2e:
         payload = {
             "summary": {
                 "pdf": str(TEST_PDF_PATH),
-                "source_file": TEST_PDF_PATH.name,
+                "source_file": ACTIVE_SOURCE_FILE,
                 "parser_blocks": len(parsed_blocks),
                 "image_caption_blocks": len(image_caption_blocks),
                 "chunks_created": len(chunks),
                 "images_extracted": len(image_rows),
                 "source_file_all_chunks_ok": all(
-                    c.get("source_file") == TEST_PDF_PATH.name for c in chunks
+                    c.get("source_file") == ACTIVE_SOURCE_FILE for c in chunks
                 ),
             },
             "chunks": chunks,

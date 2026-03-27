@@ -19,6 +19,7 @@ class ImageExtractor:
 		pdf_path: str | Path,
 		output_dir: str | Path,
 		scanned_pages: set[int] | None = None,
+		page_blocks: list[dict[str, Any]] | None = None,
 	) -> list[dict[str, Any]]:
 		"""
 		Extract images from PDF and return metadata rows:
@@ -35,27 +36,43 @@ class ImageExtractor:
 		source_file = path.name
 		rows: list[dict[str, Any]] = []
 		scanned_page_set = set(scanned_pages or set())
+		document_blocks_by_page = self._group_document_blocks_by_page(page_blocks or [])
 
 		with fitz.open(path) as doc:
 			for page_number, page in enumerate(doc, start=1):
 				page_width = float(page.rect.width or 0.0)
 				page_height = float(page.rect.height or 0.0)
-				text_blocks = self._extract_text_blocks(page)
-				heading_blocks = [b for b in text_blocks if self._looks_like_heading(b["text"])]
+				raw_text_blocks = self._extract_text_blocks(page)
+				document_text_blocks = self._convert_document_blocks_to_text_blocks(
+					document_blocks_by_page.get(page_number, []),
+					page.rect,
+				)
+				text_blocks = self._select_text_blocks_for_page(
+					raw_text_blocks=raw_text_blocks,
+					document_text_blocks=document_text_blocks,
+					prefer_document_text=(page_number in scanned_page_set),
+				)
+				heading_blocks = self._extract_heading_blocks(text_blocks)
 
 				placements = self._extract_image_placements(page)
+				embedded_groups = self._group_placements_into_figures(placements, gap=10.0)
+				scanned_groups: list[list[dict[str, Any]]] = []
+				used_scanned_fallback = False
 				has_non_full_embedded = any(
 					not self.is_full_page_image(p["rect"], page_width, page_height)
 					for p in placements
 				)
 				if not has_non_full_embedded:
-					scanned_candidates = self._detect_scanned_region_placements(page, text_blocks)
+					scanned_candidates = self._detect_scanned_region_placements(page, raw_text_blocks)
 					if scanned_candidates:
+						used_scanned_fallback = True
 						print(
 							f"[IMAGE DETECT] page={page_number}, scanned_candidates={len(scanned_candidates)}"
 						)
-						placements.extend(scanned_candidates)
-				groups = self._group_placements_into_figures(placements)
+						# Keep scanned candidates as individual groups to prevent over-merge into full-page boxes.
+						scanned_groups = [[cand] for cand in scanned_candidates]
+
+				groups = [*embedded_groups, *scanned_groups]
 				page_text = self._build_page_text(text_blocks)
 				caption_candidates = self._extract_figure_caption_candidates(page_text)
 				caption_by_group_index = self._assign_captions_to_groups(groups, caption_candidates)
@@ -78,13 +95,31 @@ class ImageExtractor:
 					area_ratio = self._compute_area_ratio(figure_rect, page_width, page_height)
 					is_full = self.is_full_page_image(figure_rect, page_width, page_height)
 					page_has_meaningful_text = self.has_meaningful_text(page_text)
-					is_scanned_page = page_number in scanned_page_set
+					is_scanned_page = (page_number in scanned_page_set) or used_scanned_fallback
+					if is_scanned_page and document_text_blocks:
+						text_blocks = document_text_blocks
+						heading_blocks = self._extract_heading_blocks(text_blocks)
+						page_text = self._build_page_text(text_blocks)
+						page_has_meaningful_text = self.has_meaningful_text(page_text)
+						surrounding_text = self._get_surrounding_text(text_blocks, figure_rect)
+						nearest_heading = self._get_nearest_heading(heading_blocks, figure_rect)
+						explicit_caption = caption_by_group_index.get(figure_index - 1, "")
+						resolved_caption = self._resolve_caption_for_figure(
+							text_blocks=text_blocks,
+							figure_rect=figure_rect,
+							explicit_caption=explicit_caption,
+						)
 					has_caption = self.has_caption_nearby(text_blocks, figure_rect) or bool(str(resolved_caption or "").strip())
 					is_table_like = self.looks_like_table(
 						text_blocks=text_blocks,
 						image_bbox=figure_rect,
 						resolved_caption=resolved_caption,
 						surrounding_text=surrounding_text,
+					)
+					print(
+						f"[IMAGE CANDIDATE] page={page_number}, "
+						f"bbox=({figure_rect.x0:.1f},{figure_rect.y0:.1f},{figure_rect.x1:.1f},{figure_rect.y1:.1f}), "
+						f"area_ratio={area_ratio:.3f}"
 					)
 					keep = self._should_keep_image_candidate(
 						is_full=is_full,
@@ -129,6 +164,82 @@ class ImageExtractor:
 					)
 
 		return rows
+
+	@staticmethod
+	def _group_document_blocks_by_page(
+		page_blocks: list[dict[str, Any]],
+	) -> dict[int, list[dict[str, Any]]]:
+		grouped: dict[int, list[dict[str, Any]]] = {}
+		for block in page_blocks:
+			page_number = int((block or {}).get("page_number") or 1)
+			grouped.setdefault(page_number, []).append(block)
+		return grouped
+
+	@staticmethod
+	def _convert_document_blocks_to_text_blocks(
+		page_blocks: list[dict[str, Any]],
+		page_rect: fitz.Rect,
+	) -> list[dict[str, Any]]:
+		filtered = [b for b in page_blocks if str((b or {}).get("text") or "").strip()]
+		if not filtered:
+			return []
+
+		height = max(1.0, float(page_rect.height))
+		band_height = max(18.0, height / max(1, len(filtered)))
+		text_blocks: list[dict[str, Any]] = []
+
+		for idx, block in enumerate(filtered):
+			y0 = min(page_rect.y1 - 1.0, page_rect.y0 + (idx * band_height))
+			y1 = min(page_rect.y1, max(y0 + 18.0, y0 + band_height))
+			text_blocks.append(
+				{
+					"text": str(block.get("text") or "").strip(),
+					"rect": fitz.Rect(page_rect.x0, y0, page_rect.x1, y1),
+					"block_type": str(block.get("block_type") or "paragraph"),
+					"heading_context": str(block.get("heading_context") or "").strip(),
+				}
+			)
+
+		return text_blocks
+
+	@staticmethod
+	def _select_text_blocks_for_page(
+		raw_text_blocks: list[dict[str, Any]],
+		document_text_blocks: list[dict[str, Any]],
+		prefer_document_text: bool,
+	) -> list[dict[str, Any]]:
+		if prefer_document_text and document_text_blocks:
+			return document_text_blocks
+		if raw_text_blocks:
+			return raw_text_blocks
+		if document_text_blocks:
+			return document_text_blocks
+		return raw_text_blocks
+
+	@staticmethod
+	def _extract_heading_blocks(text_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+		headings: list[dict[str, Any]] = []
+		seen: set[tuple[str, int, int]] = set()
+		for block in text_blocks:
+			text = str(block.get("text") or "").strip()
+			rect = block.get("rect")
+			if not text or rect is None:
+				continue
+
+			if str(block.get("block_type") or "") == "heading" or ImageExtractor._looks_like_heading(text):
+				key = (text, int(rect.x0), int(rect.y0))
+				if key not in seen:
+					headings.append({"text": text, "rect": rect})
+					seen.add(key)
+
+			heading_context = str(block.get("heading_context") or "").strip()
+			if heading_context:
+				key = (heading_context, int(rect.x0), int(rect.y0))
+				if key not in seen:
+					headings.append({"text": heading_context, "rect": rect})
+					seen.add(key)
+
+		return headings
 
 	@staticmethod
 	def _compute_area_ratio(img_bbox: fitz.Rect, page_width: float, page_height: float) -> float:
@@ -203,11 +314,11 @@ class ImageExtractor:
 		- Medium-large no-caption images are retained when table-like, else suppressed only if near-full-page.
 		- Smaller images are retained as figure candidates.
 		"""
-		if is_full:
+		if is_full and not is_scanned_page:
 			return False
 
 		# Ignore near-full-page captures to avoid ingesting scanned page backgrounds.
-		if area_ratio >= 0.85:
+		if area_ratio >= 0.85 and not is_scanned_page:
 			return False
 
 		if area_ratio >= 0.70 and not has_caption and not is_table_like:

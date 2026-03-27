@@ -112,28 +112,11 @@ class OCRPipeline:
 			paddle_text, paddle_conf = self._run_paddleocr(processed)
 			response["raw_text"] = paddle_text
 			paddle_valid = bool(paddle_text) and self._is_unicode_valid(paddle_text)
-			if ocr_profile == "garbled_table" and paddle_text:
-				response.update(
-					{
-						"text": paddle_text,
-						"confidence": float(paddle_conf),
-						"engine_used": "paddleocr",
-					}
-				)
-				return response
 
-			if paddle_valid and (paddle_conf >= 0.80 or route_reason in {"scanned", "garbled", "non_latin"}):
-				response.update(
-					{
-						"text": paddle_text,
-						"confidence": float(paddle_conf),
-						"engine_used": "paddleocr",
-					}
-				)
-				return response
-
-			tess_lang = self._detect_tesseract_langs(processed)
-			if tess_lang != "eng" and ocr_profile != "garbled_table":
+			# Deterministic policy:
+			# - scanned pages use PaddleOCR first
+			# - garbled parser output on digitized pages may also fall back to OCR
+			if route_reason in {"scanned", "garbled", "forced"}:
 				if paddle_valid:
 					response.update(
 						{
@@ -142,12 +125,16 @@ class OCRPipeline:
 							"engine_used": "paddleocr",
 						}
 					)
-				return response
-			if ocr_profile == "garbled_table" and tess_lang == "eng":
-				tess_lang = "san+hin+eng"
+					return response
 
-			tess_text, tess_conf = self._run_tesseract(processed, tess_lang)
-			if ocr_profile == "garbled_table" and tess_text:
+				# Use Tesseract only if Paddle explicitly failed to produce valid output.
+				tess_lang = "eng"
+				if ocr_profile == "garbled_table":
+					tess_lang = "san+hin+eng"
+				else:
+					tess_lang = self._detect_tesseract_langs(processed)
+
+				tess_text, tess_conf = self._run_tesseract(processed, tess_lang)
 				response.update(
 					{
 						"text": tess_text,
@@ -157,21 +144,12 @@ class OCRPipeline:
 				)
 				return response
 
-			if paddle_valid and paddle_conf >= tess_conf:
-				response.update(
-					{
-						"text": paddle_text,
-						"confidence": float(paddle_conf),
-						"engine_used": "paddleocr",
-					}
-				)
-				return response
-
+			# Non-scanned, non-garbled pages should remain on the structured parser path.
 			response.update(
 				{
-					"text": tess_text,
-					"confidence": float(tess_conf),
-					"engine_used": "tesseract",
+					"text": "",
+					"confidence": 0.0,
+					"engine_used": "none",
 				}
 			)
 			return response
