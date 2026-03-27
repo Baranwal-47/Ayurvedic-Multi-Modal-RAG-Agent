@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 import unicodedata
@@ -15,6 +17,16 @@ class DoclingParser:
 	# Typical symbols seen when PDF glyph encodings are decoded without proper cmap.
 	_MOJIBAKE_HINT_CHARS = set("¶¤¦µ¿¡¢£¬÷×ØÐÞþðøåæçèéêëìíîïñòóôõöùúûüýÿ")
 
+	def __init__(self) -> None:
+		self._docling_converter: Any | None = None
+
+	def _get_docling_converter(self):
+		if self._docling_converter is None:
+			from docling.document_converter import DocumentConverter
+
+			self._docling_converter = DocumentConverter()
+		return self._docling_converter
+
 	def parse(self, pdf_path: str | Path) -> list[dict[str, Any]]:
 		"""
 		Parse a PDF and return blocks with keys:
@@ -24,8 +36,23 @@ class DoclingParser:
 		if not path.exists():
 			raise FileNotFoundError(f"PDF not found: {path}")
 
+		auto_batch_size = max(1, int(os.getenv("DOCLING_AUTO_BATCH_SIZE", "4")))
+		explicit_batch_size = int(os.getenv("DOCLING_PAGE_BATCH_SIZE", "4"))
+
+		with fitz.open(path) as doc:
+			total_pages = int(doc.page_count)
+
+		batch_size = explicit_batch_size if explicit_batch_size > 0 else auto_batch_size
+
 		try:
-			blocks = self._parse_with_docling(path)
+			if batch_size > 0:
+				print(
+					f"[DoclingParser] Using Docling batched mode "
+					f"(pages={total_pages}, batch_size={batch_size})"
+				)
+				blocks = self._parse_with_docling_batched(path, batch_size=batch_size)
+			else:
+				blocks = self._parse_with_docling(path)
 			if blocks:
 				return blocks
 			print("[DoclingParser] WARNING: zero blocks extracted; using PyMuPDF fallback")
@@ -33,6 +60,55 @@ class DoclingParser:
 		except Exception as exc:
 			print(f"[DoclingParser] Docling parse failed ({exc}); using PyMuPDF fallback")
 			return self._parse_with_pymupdf(path)
+
+	def _parse_with_docling_batched(self, pdf_path: Path, batch_size: int) -> list[dict[str, Any]]:
+		"""Parse large PDFs in small page windows to reduce peak memory pressure."""
+		if batch_size <= 0:
+			return self._parse_with_docling(pdf_path)
+
+		with fitz.open(pdf_path) as src_doc:
+			total_pages = int(src_doc.page_count)
+
+		all_blocks: list[dict[str, Any]] = []
+		with tempfile.TemporaryDirectory(prefix="docling_batch_") as tmp_dir:
+			tmp_root = Path(tmp_dir)
+
+			for start_page in range(1, total_pages + 1, batch_size):
+				end_page = min(total_pages, start_page + batch_size - 1)
+				batch_pdf = tmp_root / f"batch_{start_page:04d}_{end_page:04d}.pdf"
+
+				with fitz.open(pdf_path) as src_doc:
+					with fitz.open() as dst_doc:
+						dst_doc.insert_pdf(src_doc, from_page=start_page - 1, to_page=end_page - 1)
+						dst_doc.save(batch_pdf)
+
+				try:
+					batch_blocks = self._parse_with_docling(batch_pdf, source_file=pdf_path.name)
+				except Exception as exc:
+					print(
+						f"[DoclingParser] Batch {start_page}-{end_page} failed with Docling "
+						f"({exc}); falling back to PyMuPDF for this batch"
+					)
+					batch_blocks = self._parse_with_pymupdf(
+						pdf_path,
+						source_file=pdf_path.name,
+						start_page=start_page,
+						end_page=end_page,
+					)
+
+				for block in batch_blocks:
+					local_page = int(block.get("page_number") or 1)
+					global_page = (start_page - 1) + local_page
+					if global_page < start_page:
+						global_page = start_page
+					if global_page > end_page:
+						global_page = end_page
+					block["page_number"] = global_page
+					block["source_file"] = pdf_path.name
+
+				all_blocks.extend(batch_blocks)
+
+		return all_blocks
 
 	def is_page_scanned(self, page_blocks: list[dict[str, Any]]) -> bool:
 		"""Return True when page text is empty or near-empty (OCR candidate)."""
@@ -160,12 +236,11 @@ class DoclingParser:
 
 		return False
 
-	def _parse_with_docling(self, pdf_path: Path) -> list[dict[str, Any]]:
-		from docling.document_converter import DocumentConverter
-
-		converter = DocumentConverter()
+	def _parse_with_docling(self, pdf_path: Path, source_file: str | None = None) -> list[dict[str, Any]]:
+		converter = self._get_docling_converter()
 		conversion = converter.convert(str(pdf_path))
 		doc = conversion.document
+		file_name = source_file or pdf_path.name
 
 		blocks: list[dict[str, Any]] = []
 		heading_by_page: dict[int, str] = {}
@@ -191,19 +266,34 @@ class DoclingParser:
 					"text": text,
 					"block_type": block_type,
 					"page_number": page_number,
-					"source_file": pdf_path.name,
+					"source_file": file_name,
 					"heading_context": heading_context,
 				}
 			)
 
 		return blocks
 
-	def _parse_with_pymupdf(self, pdf_path: Path) -> list[dict[str, Any]]:
+	def _parse_with_pymupdf(
+		self,
+		pdf_path: Path,
+		source_file: str | None = None,
+		start_page: int | None = None,
+		end_page: int | None = None,
+	) -> list[dict[str, Any]]:
 		blocks: list[dict[str, Any]] = []
 		heading_by_page: dict[int, str] = {}
+		file_name = source_file or pdf_path.name
+		range_start = max(1, int(start_page or 1))
 
 		with fitz.open(pdf_path) as doc:
+			range_end = min(int(end_page or doc.page_count), int(doc.page_count))
+			if range_end < range_start:
+				return []
+
 			for page_idx, page in enumerate(doc, start=1):
+				if page_idx < range_start or page_idx > range_end:
+					continue
+
 				page_dict = page.get_text("dict")
 				for block in page_dict.get("blocks", []):
 					if block.get("type") != 0:
@@ -226,7 +316,7 @@ class DoclingParser:
 							"text": text,
 							"block_type": block_type,
 							"page_number": page_idx,
-							"source_file": pdf_path.name,
+							"source_file": file_name,
 							"heading_context": heading_context,
 						}
 					)

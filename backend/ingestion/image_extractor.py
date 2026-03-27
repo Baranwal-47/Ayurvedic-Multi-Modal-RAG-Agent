@@ -6,7 +6,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+import cv2
 import fitz
+import numpy as np
 
 
 class ImageExtractor:
@@ -42,6 +44,17 @@ class ImageExtractor:
 				heading_blocks = [b for b in text_blocks if self._looks_like_heading(b["text"])]
 
 				placements = self._extract_image_placements(page)
+				has_non_full_embedded = any(
+					not self.is_full_page_image(p["rect"], page_width, page_height)
+					for p in placements
+				)
+				if not has_non_full_embedded:
+					scanned_candidates = self._detect_scanned_region_placements(page, text_blocks)
+					if scanned_candidates:
+						print(
+							f"[IMAGE DETECT] page={page_number}, scanned_candidates={len(scanned_candidates)}"
+						)
+						placements.extend(scanned_candidates)
 				groups = self._group_placements_into_figures(placements)
 				page_text = self._build_page_text(text_blocks)
 				caption_candidates = self._extract_figure_caption_candidates(page_text)
@@ -186,19 +199,16 @@ class ImageExtractor:
 		Classify image candidates to reduce scanned-page false positives.
 
 		Rules:
-		- Full-page images on pages already classified as scanned are ignored.
-		- Full-page images with meaningful page text are likely scanned backgrounds -> ignore.
-		- Full-page images with low page text can be true diagrams -> keep.
+		- Full-page and near-full-page images are treated as page snapshots and ignored.
 		- Medium-large no-caption images are retained when table-like, else suppressed only if near-full-page.
 		- Smaller images are retained as figure candidates.
 		"""
-		if is_scanned_page and is_full:
+		if is_full:
 			return False
 
-		if is_full:
-			if page_has_meaningful_text:
-				return False
-			return True
+		# Ignore near-full-page captures to avoid ingesting scanned page backgrounds.
+		if area_ratio >= 0.85:
+			return False
 
 		if area_ratio >= 0.70 and not has_caption and not is_table_like:
 			return False
@@ -363,6 +373,113 @@ class ImageExtractor:
 					placements.append({"xref": xref, "rect": fitz.Rect(rect)})
 
 		return ImageExtractor._dedupe_placements(placements)
+
+	@staticmethod
+	def _detect_scanned_region_placements(
+		page: fitz.Page,
+		text_blocks: list[dict[str, Any]],
+	) -> list[dict[str, Any]]:
+		"""Detect diagram-like regions from scanned page rendering when embedded image extraction is insufficient."""
+		pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+		arr = np.frombuffer(pix.samples, dtype=np.uint8)
+		img = arr.reshape(pix.height, pix.width, pix.n)
+
+		if pix.n == 1:
+			gray = img
+		else:
+			gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
+
+		# Invert-binary map for connected component extraction.
+		_, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+		kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+		closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+		contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		if not contours:
+			return []
+
+		img_h, img_w = gray.shape[:2]
+		if img_h <= 0 or img_w <= 0:
+			return []
+
+		scale_x = float(page.rect.width) / float(img_w)
+		scale_y = float(page.rect.height) / float(img_h)
+		text_rects = [b.get("rect") for b in text_blocks if isinstance(b.get("rect"), fitz.Rect)]
+
+		candidates: list[dict[str, Any]] = []
+		for cnt in contours:
+			x, y, w, h = cv2.boundingRect(cnt)
+			if w <= 0 or h <= 0:
+				continue
+
+			area_ratio = (w * h) / float(img_w * img_h)
+			w_ratio = w / float(img_w)
+			h_ratio = h / float(img_h)
+
+			# Ignore tiny, thin, and near-full-page regions.
+			if area_ratio < 0.015 or area_ratio >= 0.70:
+				continue
+			if w_ratio < 0.10 or h_ratio < 0.08:
+				continue
+
+			rect = fitz.Rect(
+				x * scale_x,
+				y * scale_y,
+				(x + w) * scale_x,
+				(y + h) * scale_y,
+			)
+
+			overlap_ratio = ImageExtractor._text_overlap_ratio(rect, text_rects)
+			if overlap_ratio > 0.60:
+				continue
+
+			# Prefer line-rich candidates (diagrams) over plain text patches.
+			edges = cv2.Canny(gray[y : y + h, x : x + w], 80, 180)
+			edge_density = float(np.count_nonzero(edges)) / float(max(1, w * h))
+			if edge_density < 0.012 and overlap_ratio > 0.30:
+				continue
+
+			candidates.append(
+				{
+					"xref": None,
+					"rect": rect,
+					"score": edge_density + (0.5 - overlap_ratio),
+				}
+			)
+
+		# NMS-like suppression for overlapping candidates.
+		candidates.sort(key=lambda c: float(c.get("score") or 0.0), reverse=True)
+		picked: list[dict[str, Any]] = []
+		for cand in candidates:
+			if any(ImageExtractor._iou(cand["rect"], p["rect"]) >= 0.60 for p in picked):
+				continue
+			picked.append({"xref": None, "rect": cand["rect"]})
+
+		return picked
+
+	@staticmethod
+	def _text_overlap_ratio(rect: fitz.Rect, text_rects: list[fitz.Rect]) -> float:
+		rect_area = max(1.0, float(rect.width) * float(rect.height))
+		overlap_area = 0.0
+		for tr in text_rects:
+			inter = rect & tr
+			if inter.is_empty:
+				continue
+			overlap_area += max(0.0, float(inter.width)) * max(0.0, float(inter.height))
+		return min(1.0, overlap_area / rect_area)
+
+	@staticmethod
+	def _iou(a: fitz.Rect, b: fitz.Rect) -> float:
+		inter = a & b
+		if inter.is_empty:
+			return 0.0
+		inter_area = max(0.0, float(inter.width)) * max(0.0, float(inter.height))
+		a_area = max(0.0, float(a.width)) * max(0.0, float(a.height))
+		b_area = max(0.0, float(b.width)) * max(0.0, float(b.height))
+		den = a_area + b_area - inter_area
+		if den <= 0:
+			return 0.0
+		return inter_area / den
 
 	@staticmethod
 	def _dedupe_placements(placements: list[dict[str, Any]]) -> list[dict[str, Any]]:

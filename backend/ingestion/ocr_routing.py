@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+import gc
+import os
 from pathlib import Path
+import time
 from typing import Any
 
 import fitz
@@ -186,6 +189,27 @@ def attach_ocr_to_blocks(
 	return parsed_blocks
 
 
+def _resolve_ocr_batch_size(page_count: int) -> int:
+	"""Resolve OCR routing batch size with always-on batching defaults."""
+	raw = str(os.getenv("OCR_PAGE_BATCH_SIZE", "")).strip()
+	if raw:
+		try:
+			return max(1, int(raw))
+		except Exception:
+			print(f"[OCR ROUTING] Invalid OCR_PAGE_BATCH_SIZE='{raw}', using auto mode")
+
+	auto_batch = max(1, int(os.getenv("OCR_AUTO_BATCH_SIZE", "4")))
+	return min(page_count, auto_batch)
+
+
+def _iter_page_batches(page_count: int, batch_size: int):
+	start = 1
+	while start <= page_count:
+		end = min(page_count, start + batch_size - 1)
+		yield start, end
+		start = end + 1
+
+
 def apply_ocr_routing_to_document(
 	pdf_path: str | Path,
 	base_blocks: list[dict[str, Any]],
@@ -198,6 +222,13 @@ def apply_ocr_routing_to_document(
 	with fitz.open(path) as doc:
 		page_count = doc.page_count
 
+	batch_size = _resolve_ocr_batch_size(page_count)
+	batch_cooldown_sec = float(os.getenv("OCR_BATCH_COOLDOWN_SEC", "0"))
+	print(
+		f"[OCR ROUTING] page_count={page_count}, batch_size={batch_size}, "
+		f"cooldown={batch_cooldown_sec:.2f}s"
+	)
+
 	grouped = _group_blocks_by_page(base_blocks)
 	rebuilt: list[dict[str, Any]] = []
 	scanned_pages: list[int] = []
@@ -206,41 +237,48 @@ def apply_ocr_routing_to_document(
 	ocr_engine_counts: Counter = Counter()
 	ocr_reason_counts: Counter = Counter()
 
-	for page in range(1, page_count + 1):
-		page_blocks = grouped.get(page, [])
-		decision = classify_page_for_ocr(page, page_blocks, parser)
-		use_ocr = bool(force_ocr_all_pages) or decision.use_ocr
-		reason = "forced" if force_ocr_all_pages else decision.reason
+	for batch_start, batch_end in _iter_page_batches(page_count, batch_size):
+		print(f"[OCR ROUTING] Processing batch pages {batch_start}-{batch_end}")
 
-		if decision.scanned:
-			scanned_pages.append(page)
-		if decision.garbled:
-			garbled_pages.append(page)
-		if decision.non_latin:
-			non_latin_pages.append(page)
+		for page in range(batch_start, batch_end + 1):
+			page_blocks = grouped.get(page, [])
+			decision = classify_page_for_ocr(page, page_blocks, parser)
+			use_ocr = bool(force_ocr_all_pages) or decision.use_ocr
+			reason = "forced" if force_ocr_all_pages else decision.reason
 
-		if not use_ocr:
-			rebuilt.extend(page_blocks)
-			continue
+			if decision.scanned:
+				scanned_pages.append(page)
+			if decision.garbled:
+				garbled_pages.append(page)
+			if decision.non_latin:
+				non_latin_pages.append(page)
 
-		ocr_reason_counts[reason or "unknown"] += 1
-		ocr_profile = "default"
-		if reason == "garbled" and _is_garbled_table_candidate(page_blocks, parser):
-			ocr_profile = "garbled_table"
-		ocr_result = ocr.process_page(path, page, route_reason=reason, ocr_profile=ocr_profile)
-		engine = str((ocr_result or {}).get("engine_used") or "unknown")
-		ocr_engine_counts[engine] += 1
+			if not use_ocr:
+				rebuilt.extend(page_blocks)
+				continue
 
-		updated = attach_ocr_to_blocks(
-			parsed_blocks=page_blocks,
-			page_number=page,
-			ocr_result=ocr_result,
-			scanned=decision.scanned or bool(force_ocr_all_pages),
-			garbled=decision.garbled and not decision.scanned,
-			parser=parser,
-			source_file=path.name,
-		)
-		rebuilt.extend(updated)
+			ocr_reason_counts[reason or "unknown"] += 1
+			ocr_profile = "default"
+			if reason == "garbled" and _is_garbled_table_candidate(page_blocks, parser):
+				ocr_profile = "garbled_table"
+			ocr_result = ocr.process_page(path, page, route_reason=reason, ocr_profile=ocr_profile)
+			engine = str((ocr_result or {}).get("engine_used") or "unknown")
+			ocr_engine_counts[engine] += 1
+
+			updated = attach_ocr_to_blocks(
+				parsed_blocks=page_blocks,
+				page_number=page,
+				ocr_result=ocr_result,
+				scanned=decision.scanned or bool(force_ocr_all_pages),
+				garbled=decision.garbled and not decision.scanned,
+				parser=parser,
+				source_file=path.name,
+			)
+			rebuilt.extend(updated)
+
+		gc.collect()
+		if batch_cooldown_sec > 0:
+			time.sleep(batch_cooldown_sec)
 
 	stats = {
 		"scanned_pages": scanned_pages,

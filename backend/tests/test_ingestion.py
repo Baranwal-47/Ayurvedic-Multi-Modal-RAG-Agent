@@ -39,7 +39,7 @@ print("[test_ingestion] OCR warming up in background...")
 # ))
 TEST_PDF_PATH = Path(os.getenv(
     "TEST_PDF_PATH",
-    ROOT / "data" / "pdfs" / "Official Formularies & Pharmacopoea - PDF Format" / "API - PDF Format" /  "API - Vol - I" / "Classical References" / "Slokas Vol 1.pdf"
+    ROOT / "data" / "pdfs" / "93aa6-145-rasa-shastra.pdf"
 ))
 
 TEST_OUTPUT_ROOT = ROOT / "data" / "images" / "test_ingestion_test"
@@ -48,7 +48,51 @@ TEST_USE_DOCLING = os.getenv("TEST_USE_DOCLING", "1").strip() in {"1", "true", "
 
 
 def get_effective_test_pdf_path(pdf_path: Path) -> Path:
-    """Use only first 15 pages for Slokas Vol 1.pdf to keep test runtime manageable."""
+    """Use a subset PDF for known heavy targets to keep runtime manageable."""
+    if pdf_path.name.lower() == "93aa6-145-rasa-shastra.pdf":
+        if not pdf_path.exists():
+            return pdf_path
+
+        tmp_dir = TEST_OUTPUT_ROOT / "_tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        subset_pdf = tmp_dir / f"{pdf_path.stem}_p20_p40.pdf"
+
+        try:
+            with fitz.open(pdf_path) as src:
+                total_pages = src.page_count
+                start_page = 20
+                end_page = 40
+
+                if total_pages < start_page:
+                    print(
+                        f"[test_ingestion] WARN: {pdf_path.name} has only {total_pages} pages; "
+                        f"cannot create 20-40 subset. Using full PDF"
+                    )
+                    return pdf_path
+
+                if subset_pdf.exists():
+                    try:
+                        with fitz.open(subset_pdf) as cached:
+                            expected_pages = end_page - start_page + 1
+                            if cached.page_count == expected_pages:
+                                print(f"[test_ingestion] Using cached pages 20-40 subset: {subset_pdf}")
+                                return subset_pdf
+                    except Exception:
+                        pass
+
+                with fitz.open() as dst:
+                    dst.insert_pdf(src, from_page=start_page - 1, to_page=min(end_page - 1, total_pages - 1))
+                    dst.save(subset_pdf)
+
+                print(
+                    f"[test_ingestion] Limited {pdf_path.name} to pages 20-40 "
+                    f"({total_pages} pages total): {subset_pdf}"
+                )
+                return subset_pdf
+        except Exception as exc:
+            print(f"[test_ingestion] WARN: could not create 20-40 subset ({exc}); using full PDF")
+            return pdf_path
+
     if pdf_path.name.lower() != "slokas vol 1.pdf":
         return pdf_path
 
