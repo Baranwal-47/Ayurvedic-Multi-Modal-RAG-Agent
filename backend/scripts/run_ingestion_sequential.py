@@ -163,7 +163,10 @@ def main() -> int:
     backend_root = Path(__file__).resolve().parents[1]
     ingest_script = (backend_root / args.ingest_script).resolve()
     pdf_dir = (backend_root / args.pdf_dir).resolve()
+    default_pdf_list = (backend_root / Path("scripts/pdf_run_order_example.txt")).resolve()
     pdf_list_file = (backend_root / args.pdf_list).resolve() if args.pdf_list else None
+    if pdf_list_file is None and default_pdf_list.exists():
+        pdf_list_file = default_pdf_list
     checkpoint_file = (backend_root / args.checkpoint_file).resolve()
 
     if not ingest_script.exists():
