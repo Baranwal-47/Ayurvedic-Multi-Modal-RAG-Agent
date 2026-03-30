@@ -23,15 +23,12 @@ google-generativeai
 # -----------------------------
 # OCR
 # -----------------------------
-paddlepaddle
-paddleocr
-pytesseract
+google-cloud-vision
 
 # -----------------------------
 # PDF & Image Processing
 # -----------------------------
 pymupdf
-pdf2image
 Pillow
 opencv-python
 
@@ -46,8 +43,3 @@ tiktoken
 # -----------------------------
 sentence-transformers
 FlagEmbedding
-
-# -----------------------------
-# Document Processing
-# -----------------------------
-docling

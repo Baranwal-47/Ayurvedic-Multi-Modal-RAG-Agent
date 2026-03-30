@@ -1,4 +1,4 @@
-"""Token-aware chunking for parsed document blocks."""
+"""Semantic chunking for normalized PageModel documents."""
 
 from __future__ import annotations
 
@@ -12,165 +12,273 @@ from normalization.diacritic_normalizer import DiacriticNormalizer
 
 
 class Chunker:
-	"""Build normalized retrieval chunks from parser output blocks."""
+    """Build Qdrant-ready text chunk payloads from normalized page models."""
 
-	def __init__(self, max_tokens: int = 400, overlap_tokens: int = 50) -> None:
-		self.max_tokens = max_tokens
-		self.overlap_tokens = overlap_tokens
-		self.encoding = tiktoken.get_encoding("cl100k_base")
-		self.normalizer = DiacriticNormalizer()
+    def __init__(self, target_words: int = 180, hard_cap_words: int = 300, overlap_words: int = 40) -> None:
+        self.target_words = int(target_words)
+        self.hard_cap_words = int(hard_cap_words)
+        self.overlap_words = int(overlap_words)
+        self.encoding = tiktoken.get_encoding("cl100k_base")
+        self.normalizer = DiacriticNormalizer()
 
-	def chunk(self, blocks: list) -> list[dict[str, Any]]:
-		"""Create chunk records with a stable schema for ingestion."""
-		if not blocks:
-			return []
+    def chunk_document(self, page_models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        pages = sorted(page_models, key=lambda item: int(item.get("page_number", 0)))
+        chunks: list[dict[str, Any]] = []
+        chunk_index = 0
 
-		cleaned = [b for b in blocks if str((b or {}).get("text", "")).strip()]
-		if not cleaned:
-			return []
+        for page_model in pages:
+            page_chunks = self._chunk_page(page_model, start_index=chunk_index)
+            chunks.extend(page_chunks)
+            chunk_index += len(page_chunks)
 
-		chunks: list[dict[str, Any]] = []
-		i = 0
-		while i < len(cleaned):
-			current = cleaned[i]
-			current_text = self._clean_text(current.get("text", ""))
-			if not current_text:
-				i += 1
-				continue
+        bridge_chunks: list[dict[str, Any]] = []
+        for previous, current in zip(chunks, chunks[1:]):
+            if self._should_bridge(previous, current):
+                bridge_chunks.append(self._make_bridge_chunk(previous, current, chunk_index))
+                chunk_index += 1
 
-			block_type = str(current.get("block_type", "paragraph") or "paragraph")
-			if self._is_atomic_block(block_type):
-				chunks.append(self._make_chunk(current_text, current))
-				i += 1
-				continue
+        chunks.extend(bridge_chunks)
+        return sorted(chunks, key=lambda item: (item["page_start"], item["chunk_id"]))
 
-			merge_count = 1
-			merged_text = current_text
+    def _chunk_page(self, page_model: dict[str, Any], *, start_index: int) -> list[dict[str, Any]]:
+        page_number = int(page_model.get("page_number", 0))
+        units = [
+            unit
+            for unit in sorted(page_model.get("text_units", []), key=lambda item: int(item.get("reading_order", 0)))
+            if unit.get("kind") not in {"noise", "label"}
+        ]
+        if not units:
+            return []
 
-			if i + 1 < len(cleaned):
-				nxt = cleaned[i + 1]
-				next_text = self._clean_text(nxt.get("text", ""))
-				if next_text and not self._is_atomic_block(str(nxt.get("block_type", "paragraph") or "paragraph")):
-					if self._should_merge_consecutive(current, nxt, current_text, next_text):
-						combined = f"{current_text}\n\n{next_text}".strip()
-						if self._token_count(combined) <= self.max_tokens:
-							merged_text = combined
-							merge_count = 2
+        chunks: list[dict[str, Any]] = []
+        buffer_units: list[dict[str, Any]] = []
+        chunk_counter = start_index
 
-			parts = self._split_with_overlap(merged_text)
-			for part in parts:
-				chunks.append(self._make_chunk(part, current))
+        for unit in units:
+            kind = str(unit.get("kind") or "paragraph")
+            text = " ".join(str(unit.get("text") or "").split()).strip()
+            if not text:
+                continue
 
-			i += merge_count
+            if kind in {"caption", "shloka"}:
+                if buffer_units:
+                    chunks.extend(self._flush_buffer(page_model, buffer_units, chunk_counter))
+                    chunk_counter = start_index + len(chunks)
+                    buffer_units = []
+                chunks.append(self._make_atomic_chunk(page_model, unit, chunk_counter))
+                chunk_counter += 1
+                continue
 
-		return chunks
+            candidate = [*buffer_units, unit]
+            if self._word_count(" ".join(str(item.get("text") or "") for item in candidate)) > self.hard_cap_words:
+                chunks.extend(self._flush_buffer(page_model, buffer_units, chunk_counter))
+                chunk_counter = start_index + len(chunks)
+                buffer_units = [unit]
+            else:
+                buffer_units.append(unit)
+                if self._word_count(" ".join(str(item.get("text") or "") for item in buffer_units)) >= self.target_words:
+                    chunks.extend(self._flush_buffer(page_model, buffer_units, chunk_counter))
+                    chunk_counter = start_index + len(chunks)
+                    buffer_units = []
 
-	@staticmethod
-	def _clean_text(text: Any) -> str:
-		return " ".join(str(text or "").split()).strip()
+        if buffer_units:
+            chunks.extend(self._flush_buffer(page_model, buffer_units, chunk_counter))
 
-	@staticmethod
-	def _is_atomic_block(block_type: str) -> bool:
-		return block_type in {"table", "figure_caption"}
+        return chunks
 
-	def _token_count(self, text: str) -> int:
-		return len(self.encoding.encode(text or ""))
+    def _flush_buffer(self, page_model: dict[str, Any], units: list[dict[str, Any]], start_index: int) -> list[dict[str, Any]]:
+        if not units:
+            return []
+        text = "\n\n".join(" ".join(str(unit.get("text") or "").split()) for unit in units).strip()
+        parts = self._split_words_with_overlap(text)
+        chunks: list[dict[str, Any]] = []
+        for offset, part in enumerate(parts):
+            chunks.append(self._make_chunk(page_model, units, part, start_index + offset))
+        return chunks
 
-	def _split_with_overlap(self, text: str) -> list[str]:
-		token_ids = self.encoding.encode(text or "")
-		if len(token_ids) <= self.max_tokens:
-			return [text]
+    def _make_atomic_chunk(self, page_model: dict[str, Any], unit: dict[str, Any], chunk_index: int) -> dict[str, Any]:
+        text = " ".join(str(unit.get("text") or "").split()).strip()
+        chunk_type = "image_caption" if unit.get("kind") == "caption" else "shloka"
+        return self._make_chunk(page_model, [unit], text, chunk_index, force_chunk_type=chunk_type)
 
-		step = max(1, self.max_tokens - self.overlap_tokens)
-		parts: list[str] = []
-		start = 0
-		while start < len(token_ids):
-			end = min(start + self.max_tokens, len(token_ids))
-			part_ids = token_ids[start:end]
-			part_text = self.encoding.decode(part_ids)
-			if part_text.strip():
-				parts.append(part_text)
-			if end >= len(token_ids):
-				break
-			start += step
+    def _make_chunk(
+        self,
+        page_model: dict[str, Any],
+        units: list[dict[str, Any]],
+        text: str,
+        chunk_index: int,
+        *,
+        force_chunk_type: str | None = None,
+    ) -> dict[str, Any]:
+        doc_id = str(page_model.get("doc_id") or "unknown")
+        source_file = str(page_model.get("source_file") or "")
+        page_number = int(page_model.get("page_number") or 0)
+        section_path = list(units[-1].get("section_path") or page_model.get("section_path") or [])
+        heading_text = section_path[-1] if section_path else None
+        source_unit_ids = [str(unit.get("unit_id")) for unit in units if unit.get("unit_id")]
+        languages = self._merge_unique(units, "languages")
+        scripts = self._merge_unique(units, "scripts")
+        image_ids = self._image_ids_for_units(page_model, source_unit_ids)
+        chunk_type = force_chunk_type or self._infer_chunk_type(units)
+        normalized_text = self.normalizer.normalize(text)
+        chunk_id = f"{doc_id}:p{page_number}-{page_number}:{chunk_type}:{chunk_index}"
 
-		return parts if parts else [text]
+        return {
+            "chunk_id": chunk_id,
+            "doc_id": doc_id,
+            "source_file": source_file,
+            "page_start": page_number,
+            "page_end": page_number,
+            "page_numbers": [page_number],
+            "chunk_type": chunk_type,
+            "text": text,
+            "text_for_embedding": text,
+            "normalized_text": normalized_text,
+            "section_path": section_path,
+            "heading_text": heading_text,
+            "languages": languages,
+            "scripts": scripts,
+            "layout_type": str(page_model.get("layout_type") or "single"),
+            "route": str(page_model.get("route") or "digitized"),
+            "ocr_source": "vision" if str(page_model.get("route") or "") in {"ocr", "ocr_fallback", "scanned"} else None,
+            "ocr_confidence": page_model.get("quality", {}).get("ocr_confidence"),
+            "is_shloka": chunk_type == "shloka",
+            "shloka_id": chunk_id if chunk_type == "shloka" else None,
+            "is_multilingual": len(languages) > 1 or len(scripts) > 1,
+            "has_image_context": bool(image_ids),
+            "image_ids": image_ids,
+            "source_unit_ids": source_unit_ids,
+            "bridge_source_chunk_ids": [],
+            "shloka_number": self._extract_shloka_number(text),
+            "table_id": None,
+        }
 
-	def _should_merge_consecutive(
-		self,
-		current: dict[str, Any],
-		nxt: dict[str, Any],
-		current_text: str,
-		next_text: str,
-	) -> bool:
-		curr_type = str(current.get("block_type", "paragraph") or "paragraph")
-		next_type = str(nxt.get("block_type", "paragraph") or "paragraph")
+    def _make_bridge_chunk(self, previous: dict[str, Any], current: dict[str, Any], chunk_index: int) -> dict[str, Any]:
+        merged_text = f"{previous['text']}\n\n{current['text']}".strip()
+        truncated = " ".join(merged_text.split()[: self.hard_cap_words]).strip()
+        doc_id = previous["doc_id"]
+        chunk_id = f"{doc_id}:p{previous['page_start']}-{current['page_end']}:page_bridge:{chunk_index}"
+        languages = sorted(set(previous.get("languages", [])) | set(current.get("languages", [])))
+        scripts = sorted(set(previous.get("scripts", [])) | set(current.get("scripts", [])))
+        return {
+            "chunk_id": chunk_id,
+            "doc_id": doc_id,
+            "source_file": previous["source_file"],
+            "page_start": previous["page_start"],
+            "page_end": current["page_end"],
+            "page_numbers": [previous["page_start"], current["page_end"]],
+            "chunk_type": "page_bridge",
+            "text": truncated,
+            "text_for_embedding": truncated,
+            "normalized_text": self.normalizer.normalize(truncated),
+            "section_path": previous.get("section_path") or current.get("section_path") or [],
+            "heading_text": previous.get("heading_text") or current.get("heading_text"),
+            "languages": languages,
+            "scripts": scripts,
+            "layout_type": previous.get("layout_type") or current.get("layout_type"),
+            "route": current.get("route") or previous.get("route"),
+            "ocr_source": current.get("ocr_source") or previous.get("ocr_source"),
+            "ocr_confidence": current.get("ocr_confidence") or previous.get("ocr_confidence"),
+            "is_shloka": False,
+            "shloka_id": None,
+            "is_multilingual": len(languages) > 1 or len(scripts) > 1,
+            "has_image_context": bool(previous.get("image_ids") or current.get("image_ids")),
+            "image_ids": sorted(set(previous.get("image_ids", [])) | set(current.get("image_ids", []))),
+            "source_unit_ids": list(previous.get("source_unit_ids", [])) + list(current.get("source_unit_ids", [])),
+            "bridge_source_chunk_ids": [previous["chunk_id"], current["chunk_id"]],
+            "shloka_number": None,
+            "table_id": None,
+        }
 
-		if curr_type == "heading" and next_type == "paragraph":
-			return True
+    def _image_ids_for_units(self, page_model: dict[str, Any], source_unit_ids: list[str]) -> list[str]:
+        image_ids: list[str] = []
+        for image in page_model.get("images", []):
+            caption_unit_ids = set(image.get("caption_unit_ids", []))
+            if caption_unit_ids.intersection(source_unit_ids):
+                image_ids.append(str(image["image_id"]))
+        return image_ids
 
-		# Sanskrit verse + commentary heuristic: numbered verse followed by plain paragraph.
-		curr_shloka = self._extract_shloka_number(current_text)
-		next_shloka = self._extract_shloka_number(next_text)
-		if curr_type == "paragraph" and next_type == "paragraph" and curr_shloka and not next_shloka:
-			return True
+    @staticmethod
+    def _merge_unique(units: list[dict[str, Any]], key: str) -> list[str]:
+        values: list[str] = []
+        for unit in units:
+            for value in unit.get(key, []) or []:
+                if value not in values:
+                    values.append(str(value))
+        return values or ["unknown"]
 
-		return False
+    @staticmethod
+    def _infer_chunk_type(units: list[dict[str, Any]]) -> str:
+        first_kind = str(units[0].get("kind") or "paragraph")
+        if first_kind == "heading":
+            return "section_intro"
+        if first_kind == "caption":
+            return "image_caption"
+        if first_kind == "shloka":
+            return "shloka"
+        return "paragraph"
 
-	def _make_chunk(self, original_text: str, source_block: dict[str, Any]) -> dict[str, Any]:
-		normalized_text = self.normalizer.normalize(original_text)
-		language = self._detect_language(original_text)
-		shloka_number = self._extract_shloka_number(original_text)
+    def _split_words_with_overlap(self, text: str) -> list[str]:
+        words = text.split()
+        if len(words) <= self.hard_cap_words:
+            return [text]
 
-		return {
-			"original_text": original_text,
-			"normalized_text": normalized_text,
-			"page_number": source_block.get("page_number"),
-			"source_file": source_block.get("source_file", ""),
-			"block_type": str(source_block.get("block_type", "paragraph") or "paragraph"),
-			"language": language,
-			"heading_context": source_block.get("heading_context", ""),
-			"shloka_number": shloka_number,
-		}
+        step = max(1, self.hard_cap_words - self.overlap_words)
+        parts: list[str] = []
+        start = 0
+        while start < len(words):
+            end = min(start + self.hard_cap_words, len(words))
+            part = " ".join(words[start:end]).strip()
+            if part:
+                parts.append(part)
+            if end >= len(words):
+                break
+            start += step
+        return parts
 
-	def _detect_language(self, text: str) -> str:
-		script = self.normalizer.detect_script(text)
-		if script == "devanagari":
-			try:
-				lang = detect(text)
-				if lang == "hi":
-					return "hindi"
-				# langdetect is weak for Sanskrit; default Devanagari non-Hindi to Sanskrit.
-				return "sanskrit"
-			except Exception:
-				return "devanagari"
+    @staticmethod
+    def _word_count(text: str) -> int:
+        return len(str(text or "").split())
 
-		if script != "latin":
-			return script
+    def _should_bridge(self, previous: dict[str, Any], current: dict[str, Any]) -> bool:
+        if previous["doc_id"] != current["doc_id"]:
+            return False
+        if current["page_start"] - previous["page_end"] != 1:
+            return False
+        if previous["chunk_type"] in {"image_caption", "table_text"} or current["chunk_type"] in {"image_caption", "table_text", "section_intro"}:
+            return False
+        if previous.get("heading_text") and current.get("heading_text") and previous["heading_text"] != current["heading_text"]:
+            return False
+        prev_text = str(previous.get("text") or "").strip()
+        curr_text = str(current.get("text") or "").strip()
+        if not prev_text or not curr_text:
+            return False
+        if prev_text.endswith((".", ":", "?", "!")):
+            return False
+        return True
 
-		try:
-			lang = detect(text)
-		except Exception:
-			return "unknown"
+    def _detect_language(self, text: str) -> str:
+        script = self.normalizer.detect_script(text)
+        if script == "devanagari":
+            try:
+                lang = detect(text)
+                if lang == "hi":
+                    return "hi"
+                return "sa"
+            except Exception:
+                return "sa"
+        if script == "telugu":
+            return "te"
+        if script == "arabic":
+            return "ur"
+        return "en"
 
-		mapping = {
-			"hi": "hindi",
-			"en": "english",
-			"sa": "sanskrit",
-		}
-		return mapping.get(lang, "unknown")
+    def _token_count(self, text: str) -> int:
+        return len(self.encoding.encode(text or ""))
 
-	@staticmethod
-	def _extract_shloka_number(text: str) -> str | None:
-		if not text:
-			return None
-
-		m = re.match(r"^\s*(\d+\.\d+)\b", text)
-		if m:
-			return m.group(1)
-
-		m = re.match(r"^\s*([IVXLCDM]+\.)\s*", text, flags=re.IGNORECASE)
-		if m:
-			return m.group(1)
-
-		return None
+    @staticmethod
+    def _extract_shloka_number(text: str) -> str | None:
+        if not text:
+            return None
+        match = re.match(r"^\s*(\d+(\.\d+)?)\b", text)
+        return match.group(1) if match else None

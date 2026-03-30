@@ -7,26 +7,34 @@ Requirements:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from FlagEmbedding import BGEM3FlagModel
 
+from embeddings.model_factory import build_bge_m3_model, embedding_batch_size
+
 
 class TextEmbedder:
-	"""Hybrid embedder for text chunks using BAAI/bge-m3 via FlagEmbedding."""
+	"""Hybrid embedder for text chunks using one shared BGE-M3 configuration."""
 
 	def __init__(self, model: BGEM3FlagModel | None = None) -> None:
-		self.model = model or BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+		self.model = model or build_bge_m3_model()
+		self.default_batch_size = embedding_batch_size(default=12)
 
-	def embed(self, texts: list[str], batch_size: int = 12) -> list[dict[str, Any]]:
+	def embed(self, texts: list[str], batch_size: int | None = None) -> list[dict[str, Any]]:
 		"""Return dense + sparse vectors for each input text."""
 		if not texts:
 			return []
 
 		cleaned = [str(t or "").strip() for t in texts]
+		cleaned = [text for text in cleaned if text]
+		if not cleaned:
+			return []
+
 		encoded = self.model.encode(
 			cleaned,
-			batch_size=batch_size,
+			batch_size=int(batch_size or self.default_batch_size),
 			return_dense=True,
 			return_sparse=True,
 			return_colbert_vecs=False,

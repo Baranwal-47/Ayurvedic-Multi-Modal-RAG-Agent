@@ -49,6 +49,13 @@ class CloudinaryUploader:
             secure=True,
         )
 
+    def _timeout_sec(self) -> int:
+        """
+        Cloudinary Python SDK expects a single numeric timeout value.
+        Use the larger configured timeout so long reads are not cut short.
+        """
+        return max(int(self.connect_timeout_sec), int(self.read_timeout_sec))
+
     @classmethod
     def from_env(cls) -> "CloudinaryUploader":
         return cls(
@@ -103,7 +110,7 @@ class CloudinaryUploader:
                 resource_type="image",
                 overwrite=True,
                 invalidate=True,
-                timeout=(self.connect_timeout_sec, self.read_timeout_sec),
+                timeout=self._timeout_sec(),
             ),
         )
 
@@ -127,7 +134,7 @@ class CloudinaryUploader:
                 fn=lambda: cloudinary.api.resource(
                     public_id,
                     resource_type="image",
-                    timeout=(self.connect_timeout_sec, self.read_timeout_sec),
+                    timeout=self._timeout_sec(),
                 ),
             )
             return result if isinstance(result, dict) else None

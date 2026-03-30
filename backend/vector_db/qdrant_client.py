@@ -1,44 +1,38 @@
-"""
-vector_db/qdrant_client.py
+"""Qdrant collection management and upsert/search helpers for the ingestion rebuild."""
 
-QdrantManager — handles all Qdrant Cloud operations for the Ayurveda RAG system.
-Two collections:
-  - text_chunks  : stores text with dense + sparse vectors (bge-m3 hybrid search)
-  - image_chunks : stores image captions with dense vectors only
-"""
+from __future__ import annotations
 
 import os
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
-    VectorParams,
-    SparseVectorParams,
-    SparseIndexParams,
+    FieldCondition,
+    Filter,
+    Fusion,
+    FusionQuery,
+    MatchValue,
     PayloadSchemaType,
     PointStruct,
-    SparseVector,
     Prefetch,
-    FusionQuery,
-    Fusion,
-    Filter,
-    FieldCondition,
-    MatchValue,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
 )
 
 load_dotenv()
 
-# Collection names
 TEXT_COLLECTION = os.getenv("QDRANT_TEXT_COLLECTION", "text_chunks")
 IMAGE_COLLECTION = os.getenv("QDRANT_IMAGE_COLLECTION", "image_chunks")
-
-# bge-m3 dense vector dimension
 DENSE_DIM = 1024
 
 
 class QdrantManager:
-    def __init__(self):
+    """Own Qdrant collection lifecycle and point operations."""
+
+    def __init__(self) -> None:
         url = os.getenv("QDRANT_URL")
         api_key = os.getenv("QDRANT_API_KEY")
         timeout_sec = float(os.getenv("QDRANT_TIMEOUT_SEC", "120"))
@@ -57,259 +51,172 @@ class QdrantManager:
             self.text_collection: self.text_collection,
             self.image_collection: self.image_collection,
         }
-        print(f"[QdrantManager] Connected to {url} (timeout={timeout_sec}s)")
 
-    # ------------------------------------------------------------------
-    # Collection setup
-    # ------------------------------------------------------------------
+    def create_collections(self, recreate: bool = False) -> None:
+        existing = {collection.name for collection in self.client.get_collections().collections}
 
-    def create_collections(self, recreate: bool = False):
-        """
-        Create text_chunks and image_chunks collections.
-        Set recreate=True to wipe and rebuild (useful during development).
-        """
-        existing = [c.name for c in self.client.get_collections().collections]
+        if recreate and self.text_collection in existing:
+            self.client.delete_collection(self.text_collection)
+            existing.discard(self.text_collection)
+        if recreate and self.image_collection in existing:
+            self.client.delete_collection(self.image_collection)
+            existing.discard(self.image_collection)
 
-        # --- text_chunks ---
-        if TEXT_COLLECTION in existing:
-            if recreate:
-                self.client.delete_collection(TEXT_COLLECTION)
-                print(f"[QdrantManager] Deleted existing collection: {TEXT_COLLECTION}")
-            else:
-                print(f"[QdrantManager] Collection already exists: {TEXT_COLLECTION}")
-
-        if TEXT_COLLECTION not in existing or recreate:
+        if self.text_collection not in existing:
             self.client.create_collection(
-                collection_name=TEXT_COLLECTION,
-                vectors_config={
-                    "dense": VectorParams(size=DENSE_DIM, distance=Distance.COSINE)
-                },
-                sparse_vectors_config={
-                    "sparse": SparseVectorParams(
-                        index=SparseIndexParams(on_disk=False)
-                    )
-                },
-            )
-            self.client.create_payload_index(
                 collection_name=self.text_collection,
-                field_name="source_file",
-                field_schema=PayloadSchemaType.KEYWORD,
+                vectors_config={"dense": VectorParams(size=DENSE_DIM, distance=Distance.COSINE)},
+                sparse_vectors_config={"sparse": SparseVectorParams(index=SparseIndexParams(on_disk=False))},
             )
-            print(f"[QdrantManager] Created collection: {TEXT_COLLECTION}")
+        self._create_payload_indexes(
+            self.text_collection,
+            {
+                "doc_id": PayloadSchemaType.KEYWORD,
+                "source_file": PayloadSchemaType.KEYWORD,
+                "page_start": PayloadSchemaType.INTEGER,
+                "page_end": PayloadSchemaType.INTEGER,
+                "chunk_type": PayloadSchemaType.KEYWORD,
+                "route": PayloadSchemaType.KEYWORD,
+            },
+        )
 
-        # --- image_chunks ---
-        if IMAGE_COLLECTION in existing:
-            if recreate:
-                self.client.delete_collection(IMAGE_COLLECTION)
-                print(f"[QdrantManager] Deleted existing collection: {IMAGE_COLLECTION}")
-            else:
-                print(f"[QdrantManager] Collection already exists: {IMAGE_COLLECTION}")
-
-        if IMAGE_COLLECTION not in existing or recreate:
+        if self.image_collection not in existing:
             self.client.create_collection(
-                collection_name=IMAGE_COLLECTION,
-                vectors_config={
-                    "dense": VectorParams(size=DENSE_DIM, distance=Distance.COSINE)
-                },
-            )
-            self.client.create_payload_index(
                 collection_name=self.image_collection,
-                field_name="source_file",
-                field_schema=PayloadSchemaType.KEYWORD,
+                vectors_config={"dense": VectorParams(size=DENSE_DIM, distance=Distance.COSINE)},
             )
-            print(f"[QdrantManager] Created collection: {IMAGE_COLLECTION}")
+        self._create_payload_indexes(
+            self.image_collection,
+            {
+                "doc_id": PayloadSchemaType.KEYWORD,
+                "source_file": PayloadSchemaType.KEYWORD,
+                "page_number": PayloadSchemaType.INTEGER,
+                "image_type": PayloadSchemaType.KEYWORD,
+            },
+        )
 
-    # ------------------------------------------------------------------
-    # Upsert
-    # ------------------------------------------------------------------
-
-    def upsert_text_chunks(self, points: list[dict]):
-        """
-        Upsert text chunks into text_chunks collection.
-
-        Each point dict must have:
-          - id          : str or int (unique)
-          - dense_vector: list[float] (1024-dim)
-          - sparse_indices: list[int]
-          - sparse_values : list[float]
-          - payload     : dict with keys like original_text, normalized_text,
-                          page_number, source_file, block_type, language,
-                          shloka_number (optional)
-        """
-        qdrant_points = []
-        for p in points:
-            qdrant_points.append(
+    def upsert_text_chunks(self, points: list[dict]) -> None:
+        if not points:
+            return
+        self.client.upsert(
+            collection_name=self.text_collection,
+            points=[
                 PointStruct(
-                    id=p["id"],
+                    id=point["id"],
                     vector={
-                        "dense": p["dense_vector"],
-                        "sparse": SparseVector(
-                            indices=p["sparse_indices"],
-                            values=p["sparse_values"],
-                        ),
+                        "dense": point["dense_vector"],
+                        "sparse": SparseVector(indices=point["sparse_indices"], values=point["sparse_values"]),
                     },
-                    payload=p["payload"],
+                    payload=point["payload"],
                 )
-            )
+                for point in points
+            ],
+        )
 
-        self.client.upsert(collection_name=TEXT_COLLECTION, points=qdrant_points)
-        print(f"[QdrantManager] Upserted {len(qdrant_points)} text chunks")
-
-    def upsert_image_chunks(self, points: list[dict]):
-        """
-        Upsert image caption chunks into image_chunks collection.
-
-        Each point dict must have:
-          - id           : str or int (unique)
-          - dense_vector : list[float] (1024-dim)
-          - payload      : dict with keys like caption, image_path,
-                           page_number, source_file
-        """
-        qdrant_points = [
-            PointStruct(
-                id=p["id"],
-                vector={"dense": p["dense_vector"]},
-                payload=p["payload"],
-            )
-            for p in points
-        ]
-
-        self.client.upsert(collection_name=IMAGE_COLLECTION, points=qdrant_points)
-        print(f"[QdrantManager] Upserted {len(qdrant_points)} image chunks")
-
-    # ------------------------------------------------------------------
-    # Search
-    # ------------------------------------------------------------------
+    def upsert_image_chunks(self, points: list[dict]) -> None:
+        if not points:
+            return
+        self.client.upsert(
+            collection_name=self.image_collection,
+            points=[
+                PointStruct(
+                    id=point["id"],
+                    vector={"dense": point["dense_vector"]},
+                    payload=point["payload"],
+                )
+                for point in points
+            ],
+        )
 
     def hybrid_search_text(
         self,
+        *,
         dense_vector: list[float],
         sparse_indices: list[int],
         sparse_values: list[float],
         top_k: int = 10,
-        language_filter: str | None = None,
+        doc_id: str | None = None,
+        language: str | None = None,
     ) -> list[dict]:
-        """
-        Hybrid search on text_chunks using dense + sparse vectors via RRF fusion.
-        Optionally filter results by language metadata.
-        Returns list of payload dicts with score attached.
-        """
-        query_filter = None
-        if language_filter:
-            query_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="language",
-                        match=MatchValue(value=language_filter),
-                    )
-                ]
-            )
-
+        query_filter = self._search_filter(doc_id=doc_id, language=language)
         results = self.client.query_points(
             collection_name=self.text_collection,
             prefetch=[
-                Prefetch(
-                    query=dense_vector,
-                    using="dense",
-                    limit=top_k * 2,
-                ),
-                Prefetch(
-                    query=SparseVector(indices=sparse_indices, values=sparse_values),
-                    using="sparse",
-                    limit=top_k * 2,
-                ),
+                Prefetch(query=dense_vector, using="dense", limit=top_k * 2),
+                Prefetch(query=SparseVector(indices=sparse_indices, values=sparse_values), using="sparse", limit=top_k * 2),
             ],
             query=FusionQuery(fusion=Fusion.RRF),
             query_filter=query_filter,
             limit=top_k,
             with_payload=True,
         )
+        return [self._point_to_row(point) for point in results.points]
 
-        output = []
-        for point in results.points:
-            row = {"_score": point.score, "_id": point.id}
-            row.update(point.payload)
-            output.append(row)
-        return output
-
-    def search_images(
-        self,
-        dense_vector: list[float],
-        top_k: int = 3,
-    ) -> list[dict]:
-        """
-        Simple dense search on image_chunks collection.
-        Returns list of payload dicts.
-        """
+    def search_images(self, *, dense_vector: list[float], top_k: int = 3, doc_id: str | None = None) -> list[dict]:
+        query_filter = self._search_filter(doc_id=doc_id)
         results = self.client.query_points(
             collection_name=self.image_collection,
             query=dense_vector,
             using="dense",
+            query_filter=query_filter,
             limit=top_k,
             with_payload=True,
         )
-        output = []
-        for point in results.points:
-            row = {"_score": point.score, "_id": point.id}
-            row.update(point.payload)
-            output.append(row)
-        return output
+        return [self._point_to_row(point) for point in results.points]
 
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
-
-    def get_collection_info(self):
-        """Print basic stats for both collections."""
-        for name in [TEXT_COLLECTION, IMAGE_COLLECTION]:
-            try:
-                info = self.client.get_collection(name)
-                count = self.client.count(name).count
-                print(f"[{name}] status={info.status} | vectors={count}")
-            except Exception as e:
-                print(f"[{name}] not found or error: {e}")
+    def delete_by_doc_id(self, doc_id: str, collection: str | None = None) -> int:
+        return self._delete_by_filter(Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]), collection)
 
     def delete_by_source(self, source_file: str, collection: str | None = None) -> int:
-        """
-        Delete all points from a specific collection (or both collections when omitted)
-        where payload.source_file == source_file.
-        Returns the number of deleted points.
-        """
-        f = Filter(
-            must=[
-                FieldCondition(
-                    key="source_file",
-                    match=MatchValue(value=source_file),
-                )
-            ]
-        )
+        return self._delete_by_filter(Filter(must=[FieldCondition(key="source_file", match=MatchValue(value=source_file))]), collection)
 
-        if collection is not None:
-            collection_names = [self._resolve_collection_name(collection)]
-        else:
-            collection_names = [self.text_collection, self.image_collection]
+    def get_collection_info(self) -> None:
+        for collection_name in [self.text_collection, self.image_collection]:
+            info = self.client.get_collection(collection_name)
+            count = self.client.count(collection_name).count
+            print(f"[{collection_name}] status={info.status} count={count}")
 
+    def _delete_by_filter(self, selector: Filter, collection: str | None = None) -> int:
+        collections = [self._resolve_collection_name(collection)] if collection else [self.text_collection, self.image_collection]
         total_deleted = 0
-        for col in collection_names:
-            try:
-                before = self.client.count(col, count_filter=f).count
-            except Exception:
-                before = 0
-
+        for collection_name in collections:
+            before = int(self.client.count(collection_name=collection_name, count_filter=selector).count)
             if before > 0:
-                self.client.delete(collection_name=col, points_selector=f)
-
-            print(f"[QdrantManager] Deleted points for '{source_file}' from {col}: {before}")
-            total_deleted += int(before)
-
+                self.client.delete(collection_name=collection_name, points_selector=selector)
+            total_deleted += before
         return total_deleted
 
-    def _resolve_collection_name(self, collection: str) -> str:
+    def _create_payload_indexes(self, collection_name: str, fields: dict[str, PayloadSchemaType]) -> None:
+        for field_name, schema in fields.items():
+            try:
+                self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=schema,
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if "already exists" in message or "existing index" in message:
+                    continue
+                raise
+
+    def _search_filter(self, *, doc_id: str | None = None, language: str | None = None) -> Filter | None:
+        must: list[FieldCondition] = []
+        if doc_id:
+            must.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id)))
+        if language:
+            must.append(FieldCondition(key="languages", match=MatchValue(value=language)))
+        return Filter(must=must) if must else None
+
+    @staticmethod
+    def _point_to_row(point) -> dict:
+        row = {"_score": point.score, "_id": point.id}
+        row.update(point.payload)
+        return row
+
+    def _resolve_collection_name(self, collection: str | None) -> str:
         name = str(collection or "").strip()
         resolved = self._collection_aliases.get(name)
         if not resolved:
-            raise ValueError(
-                f"Unknown collection '{collection}'. Expected one of: "
-                f"{self.text_collection}, {self.image_collection}, text_chunks, image_chunks"
-            )
+            raise ValueError(f"Unknown collection '{collection}'")
         return resolved
