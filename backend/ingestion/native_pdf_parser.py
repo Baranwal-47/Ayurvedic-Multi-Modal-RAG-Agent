@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import unicodedata
 
 import fitz
@@ -21,7 +22,18 @@ class NativePageParse:
 class NativePDFParser:
     """Parse native PDF text into simple block records for chunking and OCR routing."""
 
-    _MOJIBAKE_HINTS = ("Ã", "Â", "�", "\ufffd")
+    _MOJIBAKE_HINTS = ("Ãƒ", "Ã‚", "ï¿½", "\ufffd")
+    _PAGE_FURNITURE_KEYWORDS = ("issn", "www.", "http", "volume", "issue", "journal")
+    _NUMBERED_SECTION_PREFIXES = (
+        "introduction",
+        "materials",
+        "methods",
+        "results",
+        "discussion",
+        "conclusion",
+        "references",
+        "abstract",
+    )
 
     def __init__(self) -> None:
         self.normalizer = DiacriticNormalizer()
@@ -151,8 +163,26 @@ class NativePDFParser:
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        lines = [" ".join(line.split()) for line in str(text or "").splitlines()]
-        return "\n".join(line for line in lines if line).strip()
+        cleaned_lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = " ".join(raw_line.split()).strip()
+            if not line:
+                continue
+            lower = line.lower()
+
+            # Remove recurring journal footer lines that are frequently merged into body blocks.
+            if re.search(r"\bwww\.ijaar\.in\b", lower) and "volume" in lower and "issue" in lower:
+                continue
+            if re.match(r"^\d{1,4}\s+www\.ijaar\.in\b", lower):
+                continue
+
+            # Drop boilerplate metadata lines that should not become retrieval chunks.
+            if "conflict of interest" in lower or "source of support" in lower or "financial support" in lower:
+                continue
+
+            cleaned_lines.append(line)
+
+        return "\n".join(cleaned_lines).strip()
 
     def _detect_languages(self, text: str) -> list[str]:
         script = self.normalizer.detect_script(text)
@@ -187,10 +217,92 @@ class NativePDFParser:
         centered = abs(((bbox.x0 + bbox.x1) / 2.0) - (page_rect.width / 2.0)) <= (page_rect.width * 0.12)
         numbered = single_line[:6].strip().replace(".", "").isdigit()
         title_like = single_line == unicodedata.normalize("NFKC", single_line).title()
+        uppercase_like = bool(single_line) and single_line.upper() == single_line
+        ends_with_colon = single_line.endswith(":")
+        normalized = re.sub(r"\s+", " ", single_line).strip().lower()
+        top_zone = float(bbox.y1) <= float(page_rect.height) * 0.14
+        bottom_zone = float(bbox.y0) >= float(page_rect.height) * 0.86
 
-        if line_count <= 2 and word_count <= 16 and (centered or numbered or (title_like and width_ratio < 0.75)):
+        if NativePDFParser._looks_like_page_furniture(
+            text=single_line,
+            normalized=normalized,
+            bbox=bbox,
+            page_rect=page_rect,
+            top_zone=top_zone,
+            bottom_zone=bottom_zone,
+        ):
+            return "noise"
+
+        if NativePDFParser._looks_like_table_row(single_line):
+            return "table_row"
+
+        if line_count <= 2 and word_count <= 16 and (
+            (uppercase_like and width_ratio < 0.90) or
+            (numbered and word_count >= 2) or
+            (ends_with_colon and word_count <= 12 and width_ratio < 0.90) or
+            (centered and width_ratio < 0.65 and word_count >= 2 and (uppercase_like or ends_with_colon)) or
+            (title_like and 2 <= word_count <= 10 and width_ratio < 0.60)
+        ):
             return "heading"
         return "paragraph"
+
+    @staticmethod
+    def _looks_like_page_furniture(
+        *,
+        text: str,
+        normalized: str,
+        bbox: fitz.Rect,
+        page_rect: fitz.Rect,
+        top_zone: bool,
+        bottom_zone: bool,
+    ) -> bool:
+        if not normalized:
+            return False
+
+        in_margin_zone = top_zone or bottom_zone
+        corner_zone = float(bbox.x0) <= float(page_rect.width) * 0.15 or float(bbox.x1) >= float(page_rect.width) * 0.85
+
+        if in_margin_zone and re.fullmatch(r"[\(\[]?\d{1,4}[\)\]]?", normalized):
+            return True
+        if not in_margin_zone:
+            return False
+        if any(keyword in normalized for keyword in NativePDFParser._PAGE_FURNITURE_KEYWORDS):
+            return True
+        if top_zone and ":" in text and re.search(r"\bet\s*al\b|etal", normalized):
+            return True
+        if corner_zone and re.match(r"^\d{1,4}\s+[a-z]", normalized):
+            return True
+        if len(text) <= 6 and text.strip(". ").isdigit():
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_table_row(text: str) -> bool:
+        compact = " ".join(str(text or "").split())
+        if not compact:
+            return False
+
+        lower = compact.lower()
+        words = compact.split()
+        word_count = len(words)
+        numeric_tokens = len(re.findall(r"\d+(?:\.\d+)?", compact))
+        has_serial_prefix = bool(re.match(r"^\d{1,3}[\.)]?\s+", compact))
+        after_serial = re.sub(r"^\d{1,3}[\.)]?\s+", "", lower).strip()
+
+        if lower.startswith(("table ", "table no", "s.no", "sample no")):
+            return True
+
+        if has_serial_prefix and any(after_serial.startswith(prefix) for prefix in NativePDFParser._NUMBERED_SECTION_PREFIXES):
+            return False
+
+        if has_serial_prefix and word_count <= 4:
+            return True
+        if has_serial_prefix and numeric_tokens >= 2 and word_count <= 12:
+            return True
+        if numeric_tokens >= 3 and word_count <= 12:
+            return True
+
+        return False
 
     @staticmethod
     def _is_non_latin_script_char(ch: str) -> bool:

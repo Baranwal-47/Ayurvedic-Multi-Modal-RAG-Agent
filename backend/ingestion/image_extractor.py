@@ -14,12 +14,16 @@ import numpy as np
 class ImageExtractor:
 	"""Extract embedded PDF images and attach local textual context metadata."""
 
+	SURROUNDING_TEXT_MAX_CHARS = 720
+	SURROUNDING_TEXT_MAX_BLOCKS = 6
+
 	def extract(
 		self,
 		pdf_path: str | Path,
 		output_dir: str | Path,
 		scanned_pages: set[int] | None = None,
 		page_blocks: list[dict[str, Any]] | None = None,
+		allowed_pages: set[int] | None = None,
 	) -> list[dict[str, Any]]:
 		"""
 		Extract images from PDF and return metadata rows:
@@ -36,10 +40,14 @@ class ImageExtractor:
 		source_file = path.name
 		rows: list[dict[str, Any]] = []
 		scanned_page_set = set(scanned_pages or set())
+		allowed_page_set = set(allowed_pages or set())
 		document_blocks_by_page = self._group_document_blocks_by_page(page_blocks or [])
 
 		with fitz.open(path) as doc:
 			for page_number, page in enumerate(doc, start=1):
+				if allowed_page_set and page_number not in allowed_page_set:
+					continue
+
 				page_width = float(page.rect.width or 0.0)
 				page_height = float(page.rect.height or 0.0)
 				raw_text_blocks = self._extract_text_blocks(page)
@@ -57,15 +65,14 @@ class ImageExtractor:
 				placements = self._extract_image_placements(page)
 				embedded_groups = self._group_placements_into_figures(placements, gap=10.0)
 				scanned_groups: list[list[dict[str, Any]]] = []
-				used_scanned_fallback = False
+				actual_scanned_page = page_number in scanned_page_set
 				has_non_full_embedded = any(
 					not self.is_full_page_image(p["rect"], page_width, page_height)
 					for p in placements
 				)
-				if not has_non_full_embedded:
+				if actual_scanned_page and not has_non_full_embedded:
 					scanned_candidates = self._detect_scanned_region_placements(page, raw_text_blocks)
 					if scanned_candidates:
-						used_scanned_fallback = True
 						print(
 							f"[IMAGE DETECT] page={page_number}, scanned_candidates={len(scanned_candidates)}"
 						)
@@ -95,8 +102,7 @@ class ImageExtractor:
 					area_ratio = self._compute_area_ratio(figure_rect, page_width, page_height)
 					is_full = self.is_full_page_image(figure_rect, page_width, page_height)
 					page_has_meaningful_text = self.has_meaningful_text(page_text)
-					is_scanned_page = (page_number in scanned_page_set) or used_scanned_fallback
-					if is_scanned_page and document_text_blocks:
+					if actual_scanned_page and document_text_blocks:
 						text_blocks = document_text_blocks
 						heading_blocks = self._extract_heading_blocks(text_blocks)
 						page_text = self._build_page_text(text_blocks)
@@ -116,6 +122,10 @@ class ImageExtractor:
 						resolved_caption=resolved_caption,
 						surrounding_text=surrounding_text,
 					)
+					text_overlap_ratio = self._text_overlap_ratio(
+						figure_rect,
+						[b["rect"] for b in text_blocks if isinstance(b.get("rect"), fitz.Rect)],
+					)
 					print(
 						f"[IMAGE CANDIDATE] page={page_number}, "
 						f"bbox=({figure_rect.x0:.1f},{figure_rect.y0:.1f},{figure_rect.x1:.1f},{figure_rect.y1:.1f}), "
@@ -127,11 +137,17 @@ class ImageExtractor:
 						has_caption=has_caption,
 						page_has_meaningful_text=page_has_meaningful_text,
 						is_table_like=is_table_like,
-						is_scanned_page=is_scanned_page,
+						is_scanned_page=actual_scanned_page,
+						text_overlap_ratio=text_overlap_ratio,
+						figure_rect=figure_rect,
+						page_width=page_width,
+						page_height=page_height,
+						resolved_caption=resolved_caption,
+						surrounding_text=surrounding_text,
 					)
 					print(
 						f"[IMAGE FILTER] page={page_number}, area_ratio={area_ratio:.2f}, "
-						f"full_page={is_full}, scanned_page={is_scanned_page}, kept={keep}"
+						f"full_page={is_full}, scanned_page={actual_scanned_page}, kept={keep}"
 					)
 					if not keep:
 						continue
@@ -189,14 +205,35 @@ class ImageExtractor:
 		text_blocks: list[dict[str, Any]] = []
 
 		for idx, block in enumerate(filtered):
-			y0 = min(page_rect.y1 - 1.0, page_rect.y0 + (idx * band_height))
-			y1 = min(page_rect.y1, max(y0 + 18.0, y0 + band_height))
+			rect = None
+			raw_bbox = block.get("bbox")
+			if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+				try:
+					candidate = fitz.Rect(
+						float(raw_bbox[0]),
+						float(raw_bbox[1]),
+						float(raw_bbox[2]),
+						float(raw_bbox[3]),
+					)
+					candidate = candidate & page_rect
+					if not candidate.is_empty and candidate.width > 1.0 and candidate.height > 1.0:
+						rect = candidate
+				except Exception:
+					rect = None
+
+			if rect is None:
+				y0 = min(page_rect.y1 - 1.0, page_rect.y0 + (idx * band_height))
+				y1 = min(page_rect.y1, max(y0 + 18.0, y0 + band_height))
+				rect = fitz.Rect(page_rect.x0, y0, page_rect.x1, y1)
+
 			text_blocks.append(
 				{
 					"text": str(block.get("text") or "").strip(),
-					"rect": fitz.Rect(page_rect.x0, y0, page_rect.x1, y1),
+					"rect": rect,
 					"block_type": str(block.get("block_type") or "paragraph"),
 					"heading_context": str(block.get("heading_context") or "").strip(),
+					"column_id": block.get("column_id"),
+					"reading_order": block.get("reading_order"),
 				}
 			)
 
@@ -281,11 +318,16 @@ class ImageExtractor:
 	) -> bool:
 		"""Heuristic table detector from nearby text/caption cues."""
 		caption = str(resolved_caption or "").lower()
+		if ImageExtractor._is_figure_like_caption(caption):
+			return False
+
 		surround = str(surrounding_text or "").lower()
-		if "table" in caption or "table" in surround:
+		if "table" in caption:
 			return True
 
 		near_caption = ImageExtractor._extract_nearby_caption_text(text_blocks, image_bbox).lower()
+		if ImageExtractor._is_figure_like_caption(near_caption):
+			return False
 		if "table" in near_caption:
 			return True
 
@@ -298,6 +340,18 @@ class ImageExtractor:
 		return num_ratio > 0.30 and len(surround.strip()) > 30
 
 	@staticmethod
+	def _is_figure_like_caption(text: str) -> bool:
+		lower = " ".join(str(text or "").split()).lower()
+		if not lower:
+			return False
+		return bool(
+			re.match(
+				r"^(figure|fig\.?|image|plate|photo|graph|chart|diagram|scheme|illustration|panel)\b",
+				lower,
+			)
+		)
+
+	@staticmethod
 	def _should_keep_image_candidate(
 		is_full: bool,
 		area_ratio: float,
@@ -305,6 +359,12 @@ class ImageExtractor:
 		page_has_meaningful_text: bool,
 		is_table_like: bool,
 		is_scanned_page: bool,
+		text_overlap_ratio: float,
+		figure_rect: fitz.Rect,
+		page_width: float,
+		page_height: float,
+		resolved_caption: str,
+		surrounding_text: str,
 	) -> bool:
 		"""
 		Classify image candidates to reduce scanned-page false positives.
@@ -321,7 +381,29 @@ class ImageExtractor:
 		if area_ratio >= 0.85 and not is_scanned_page:
 			return False
 
+		if ImageExtractor._looks_like_decorative_asset(
+			figure_rect=figure_rect,
+			page_width=page_width,
+			page_height=page_height,
+			area_ratio=area_ratio,
+			resolved_caption=resolved_caption,
+			surrounding_text=surrounding_text,
+		):
+			return False
+
+		# Reject tiny icon-like assets unless they have a caption signal.
+		if not has_caption and not is_scanned_page:
+			min_side = min(float(figure_rect.width), float(figure_rect.height))
+			if area_ratio <= 0.012 and min_side < 72.0:
+				return False
+
+		if is_table_like and not is_scanned_page:
+			return False
+
 		if area_ratio >= 0.70 and not has_caption and not is_table_like:
+			return False
+
+		if is_table_like and page_has_meaningful_text and text_overlap_ratio >= 0.22 and not is_scanned_page:
 			return False
 
 		if area_ratio > 0.30 and not has_caption:
@@ -329,6 +411,26 @@ class ImageExtractor:
 			return True
 
 		return True
+
+	@staticmethod
+	def _looks_like_decorative_asset(
+		*,
+		figure_rect: fitz.Rect,
+		page_width: float,
+		page_height: float,
+		area_ratio: float,
+		resolved_caption: str,
+		surrounding_text: str,
+	) -> bool:
+		top_zone = float(figure_rect.y1) <= page_height * 0.16
+		bottom_zone = float(figure_rect.y0) >= page_height * 0.86
+		if not (top_zone or bottom_zone):
+			return False
+
+		context = f"{resolved_caption} {surrounding_text}".lower()
+		if any(token in context for token in ("issn", "www.", "journal", "volume", "issue")):
+			return True
+		return area_ratio <= 0.03 and (float(figure_rect.width) <= page_width * 0.28)
 
 	@staticmethod
 	def _build_page_text(text_blocks: list[dict[str, Any]]) -> str:
@@ -418,12 +520,18 @@ class ImageExtractor:
 				score += 5.0
 			if re.search(r"\([a-z]\)", lower):
 				score += 1.0
+			if "table" in lower:
+				score += 4.0
 			if ":" in text:
 				score += 0.5
 			if 10 <= len(text) <= 260:
 				score += 1.0
 			if ImageExtractor._looks_like_heading(text):
 				score -= 2.0
+			if any(token in lower for token in ("issn", "www.", "journal", "volume", "issue")):
+				score -= 4.0
+			if not ImageExtractor._is_caption_like_text(text):
+				score -= 1.5
 
 			# Prefer closer blocks below the image.
 			score -= min(vertical_gap, 120.0) / 120.0
@@ -434,9 +542,20 @@ class ImageExtractor:
 
 		candidates.sort(key=lambda x: x[0], reverse=True)
 		best_score, best_text = candidates[0]
-		if best_score < 1.0:
+		if best_score < 2.0 or not ImageExtractor._is_caption_like_text(best_text):
 			return ""
 		return best_text
+
+	@staticmethod
+	def _is_caption_like_text(text: str) -> bool:
+		lower = " ".join(str(text or "").split()).lower()
+		if not lower:
+			return False
+		if re.match(r"^(figure|fig\.?|image|plate|photo|graph|chart|diagram|scheme|illustration|panel|table)\b", lower):
+			return True
+		if ":" in lower and len(lower.split()) <= 18:
+			return True
+		return False
 
 	@staticmethod
 	def _clean_figure_caption(text: str) -> str:
@@ -712,10 +831,10 @@ class ImageExtractor:
 
 		# Prefer text blocks spatially near the image rectangle.
 		expanded = fitz.Rect(image_rect)
-		expanded.x0 -= 80
-		expanded.y0 -= 80
-		expanded.x1 += 80
-		expanded.y1 += 80
+		expanded.x0 -= 140
+		expanded.y0 -= 140
+		expanded.x1 += 140
+		expanded.y1 += 140
 
 		nearby = []
 		for block in text_blocks:
@@ -732,9 +851,44 @@ class ImageExtractor:
 
 			nearby = sorted(text_blocks, key=dist2)[:3]
 
-		nearby_sorted = sorted(nearby, key=lambda b: (b["rect"].y0, b["rect"].x0))
-		joined = " ".join(block["text"] for block in nearby_sorted)
-		return joined[:200].strip()
+		def overlap_ratio(block: dict[str, Any]) -> float:
+			rect = block["rect"]
+			inter = rect & image_rect
+			if inter.is_empty:
+				return 0.0
+			area = max(1.0, float(rect.width) * float(rect.height))
+			return (max(0.0, float(inter.width)) * max(0.0, float(inter.height))) / area
+
+		def looks_prose(text: str) -> bool:
+			compact = " ".join(str(text or "").split())
+			if len(compact.split()) < 6:
+				return False
+			return any(ch in compact for ch in ".,;:")
+
+		def score(block: dict[str, Any]) -> tuple[float, float]:
+			rect = block["rect"]
+			text = str(block.get("text") or "")
+			cx = (rect.x0 + rect.x1) / 2.0
+			cy = (rect.y0 + rect.y1) / 2.0
+			ix = (image_rect.x0 + image_rect.x1) / 2.0
+			iy = (image_rect.y0 + image_rect.y1) / 2.0
+			dist2 = (cx - ix) ** 2 + (cy - iy) ** 2
+			over = overlap_ratio(block)
+			quality = 0.0
+			if over < 0.90:
+				quality += 1.2
+			if looks_prose(text):
+				quality += 1.5
+			if len(text.split()) >= 12:
+				quality += 0.5
+			return (quality, -dist2)
+
+		prose_pool = [b for b in nearby if looks_prose(str(b.get("text") or "")) and overlap_ratio(b) < 0.95]
+		pool = prose_pool or nearby
+		top = sorted(pool, key=score, reverse=True)[: ImageExtractor.SURROUNDING_TEXT_MAX_BLOCKS]
+		top_sorted = sorted(top, key=lambda b: (b["rect"].y0, b["rect"].x0))
+		joined = " ".join(" ".join(str(block.get("text") or "").split()) for block in top_sorted)
+		return joined[: ImageExtractor.SURROUNDING_TEXT_MAX_CHARS].strip()
 
 	@staticmethod
 	def _get_nearest_heading(heading_blocks: list[dict[str, Any]], image_rect: fitz.Rect | None) -> str:
@@ -759,6 +913,11 @@ class ImageExtractor:
 	def _looks_like_heading(text: str) -> bool:
 		compact = " ".join(text.split())
 		if not compact:
+			return False
+		if re.fullmatch(r"[\(\[]?\d{1,4}[\)\]]?", compact):
+			return False
+		lower = compact.lower()
+		if any(token in lower for token in ("issn", "www.", "journal", "volume", "issue")):
 			return False
 
 		if len(compact) <= 90 and compact.isupper():

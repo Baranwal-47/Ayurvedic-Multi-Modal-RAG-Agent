@@ -29,6 +29,7 @@ google-cloud-vision
 # PDF & Image Processing
 # -----------------------------
 pymupdf
+docling
 Pillow
 opencv-python
 

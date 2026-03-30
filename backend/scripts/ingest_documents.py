@@ -22,6 +22,7 @@ from embeddings.image_embedder import ImageEmbedder
 from embeddings.text_embedder import TextEmbedder
 from ingestion.chunker import Chunker
 from ingestion.cloudinary_uploader import CloudinaryUploader
+from ingestion.docling_parser import DoclingPDFParser
 from ingestion.image_extractor import ImageExtractor
 from ingestion.image_text_linker import ImageTextLinker
 from ingestion.native_pdf_parser import NativePDFParser
@@ -110,13 +111,17 @@ def _flatten_page_blocks(page_models: list[dict[str, Any]]) -> list[dict[str, An
                     "page_number": page_model["page_number"],
                     "source_file": page_model["source_file"],
                     "heading_context": heading_context,
+                    "bbox": unit.get("bbox"),
+                    "column_id": unit.get("column_id"),
+                    "reading_order": unit.get("reading_order"),
                 }
             )
     return rows
 
 
-def _collect_page_models(pdf_path: Path, doc_id: str) -> tuple[list[dict[str, Any]], set[int]]:
+def _collect_page_models(pdf_path: Path, doc_id: str, run_state: RunState) -> tuple[list[dict[str, Any]], set[int]]:
     parser = NativePDFParser()
+    docling = DoclingPDFParser()
     classifier = PageClassifier()
     ocr = OCRPipeline()
     builder = PageModelBuilder()
@@ -128,46 +133,68 @@ def _collect_page_models(pdf_path: Path, doc_id: str) -> tuple[list[dict[str, An
 
     with fitz.open(pdf_path) as doc:
         for page_number, page in enumerate(doc, start=1):
-            native_page = parser.parse_page(page_number=page_number, page=page, source_file=pdf_path.name)
-            classification = classifier.classify_page(
-                pdf_path=pdf_path,
-                page_number=page_number,
-                native_units=native_page.text_units,
-                parser=parser,
-            )
-
-            if classification.page_type == "digitized":
-                page_model = builder.build(
-                    doc_id=doc_id,
-                    source_file=pdf_path.name,
-                    page_number=page_number,
-                    route="digitized",
-                    native_units=native_page.text_units,
-                )
-            else:
-                scanned_pages.add(page_number)
-                ocr_result = ocr.process_page(
+            try:
+                native_page = parser.parse_page(page_number=page_number, page=page, source_file=pdf_path.name)
+                classification = classifier.classify_page(
                     pdf_path=pdf_path,
                     page_number=page_number,
-                    route_reason=classification.page_type,
-                )
-                if not ocr_result.get("text_units") and native_page.text_units:
-                    raise RuntimeError(f"OCR failed on page {page_number}")
-                page_model = builder.build(
-                    doc_id=doc_id,
-                    source_file=pdf_path.name,
-                    page_number=page_number,
-                    route=classification.page_type,
-                    ocr_units=ocr_result.get("text_units") or [],
-                    ocr_confidence=ocr_result.get("confidence"),
+                    native_units=native_page.text_units,
+                    parser=parser,
                 )
 
-            page_model = layout.apply(page_model)
-            page_model = shloka.apply(page_model)
-            page_models.append(page_model)
+                if classification.page_type == "digitized":
+                    selected_units = native_page.text_units
+                    structure_engine = "pymupdf"
 
-            del native_page
-            gc.collect()
+                    if docling.available:
+                        try:
+                            docling_page = docling.parse_page(
+                                pdf_path=pdf_path,
+                                page_number=page_number,
+                                source_file=pdf_path.name,
+                            )
+                            if docling_page.text_units:
+                                selected_units = docling_page.text_units
+                                structure_engine = "docling"
+                        except Exception as exc:
+                            _log(f"[DOCLING] page {page_number} fallback to native parser: {exc}")
+
+                    page_model = builder.build(
+                        doc_id=doc_id,
+                        source_file=pdf_path.name,
+                        page_number=page_number,
+                        route="digitized",
+                        native_units=selected_units,
+                    )
+                    page_model.setdefault("quality", {})["structure_engine"] = structure_engine
+                else:
+                    scanned_pages.add(page_number)
+                    ocr_result = ocr.process_page(
+                        pdf_path=pdf_path,
+                        page_number=page_number,
+                        route_reason=classification.page_type,
+                    )
+                    if not ocr_result.get("text_units") and native_page.text_units:
+                        raise RuntimeError(f"OCR failed on page {page_number}")
+                    page_model = builder.build(
+                        doc_id=doc_id,
+                        source_file=pdf_path.name,
+                        page_number=page_number,
+                        route=classification.page_type,
+                        ocr_units=ocr_result.get("text_units") or [],
+                        ocr_confidence=ocr_result.get("confidence"),
+                    )
+
+                page_model = layout.apply(page_model)
+                page_model = shloka.apply(page_model)
+                page_models.append(page_model)
+            except Exception as exc:
+                run_state.mark_page_failed(doc_id, int(page_number), str(exc))
+                raise
+            finally:
+                if "native_page" in locals():
+                    del native_page
+                gc.collect()
 
     page_models = NoiseDetector().mark_document_noise(page_models)
     section_detector = SectionDetector()
@@ -202,6 +229,7 @@ def _upload_images(
     *,
     page_models: list[dict[str, Any]],
     uploader: CloudinaryUploader,
+    run_state: RunState,
 ) -> list[dict[str, Any]]:
     uploaded_images: list[dict[str, Any]] = []
     for page_model in page_models:
@@ -214,7 +242,15 @@ def _upload_images(
                 page_number=page_model["page_number"],
                 figure_index=int(image.get("figure_index") or 1),
             )
-            cloudinary_public_id, image_url = uploader.upload_image(local_path, public_id)
+            try:
+                cloudinary_public_id, image_url = uploader.upload_image(local_path, public_id)
+            except Exception as exc:
+                run_state.mark_page_failed(
+                    str(page_model.get("doc_id") or ""),
+                    int(page_model.get("page_number") or 0),
+                    f"image_upload_failed: {exc}",
+                )
+                raise
             if not image_url:
                 raise RuntimeError(f"Cloudinary upload returned empty URL for {local_path}")
             image["cloudinary_public_id"] = cloudinary_public_id
@@ -242,10 +278,29 @@ def ingest_pdf(
 ) -> dict[str, Any]:
     doc_id = _stable_doc_id(pdf_path)
     state = run_state.load(doc_id)
+
+    with fitz.open(pdf_path) as doc:
+        total_pages = int(doc.page_count)
+
+    completed_pages = set(int(page) for page in state.get("completed_pages", []))
+    if state.get("document_complete") and len(completed_pages) >= total_pages and not state.get("failed_pages"):
+        _log(f"[INGEST] Skipping {pdf_path.name}; all pages already completed in run_state")
+        return {
+            "doc_id": doc_id,
+            "source_file": pdf_path.name,
+            "page_count": total_pages,
+            "chunks_stored": 0,
+            "images_stored": 0,
+            "failed_pages": {},
+            "skipped": True,
+        }
+
+    run_state.start_document(doc_id)
+
     image_output_dir = image_output_root / pdf_path.stem
     image_output_dir.mkdir(parents=True, exist_ok=True)
 
-    page_models, scanned_pages = _collect_page_models(pdf_path, doc_id)
+    page_models, scanned_pages = _collect_page_models(pdf_path, doc_id, run_state)
     _attach_images(
         pdf_path=pdf_path,
         image_output_dir=image_output_dir,
@@ -254,7 +309,7 @@ def ingest_pdf(
     )
 
     chunks = Chunker().chunk_document(page_models)
-    images = _upload_images(page_models=page_models, uploader=cloudinary_uploader)
+    images = _upload_images(page_models=page_models, uploader=cloudinary_uploader, run_state=run_state)
 
     for image in images:
         linked_chunk_ids = [chunk["chunk_id"] for chunk in chunks if image["image_id"] in chunk.get("image_ids", [])]

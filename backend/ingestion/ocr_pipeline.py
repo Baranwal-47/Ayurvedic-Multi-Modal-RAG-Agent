@@ -76,7 +76,7 @@ class OCRPipeline:
             "engine_used": "none",
         }
 
-        if route_reason not in {"scanned", "garbled", "forced"}:
+        if route_reason not in {"scanned", "garbled", "ocr_fallback", "forced"}:
             return response
 
         try:
