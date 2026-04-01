@@ -60,22 +60,25 @@ class PageModelBuilder:
                 kind = "table_row"
                 block_type = "table_row"
 
-            text_units.append(
-                {
-                    "unit_id": unit.get("unit_id"),
-                    "kind": kind,
-                    "block_type": block_type,
-                    "text": text,
-                    "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-                    "column_id": unit.get("column_id"),
-                    "reading_order": int(unit.get("reading_order", len(text_units))),
-                    "confidence": unit.get("confidence"),
-                    "languages": languages,
-                    "scripts": scripts,
-                    "source_engine": str(unit.get("source_engine") or ("vision" if route != "digitized" else "pymupdf")),
-                    "section_path": list(unit.get("section_path") or []),
-                }
-            )
+            built_unit = {
+                "unit_id": unit.get("unit_id"),
+                "kind": kind,
+                "block_type": block_type,
+                "text": text,
+                "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                "column_id": unit.get("column_id"),
+                "reading_order": int(unit.get("reading_order", len(text_units))),
+                "confidence": unit.get("confidence"),
+                "languages": languages,
+                "scripts": scripts,
+                "source_engine": str(unit.get("source_engine") or ("vision" if route != "digitized" else "pymupdf")),
+                "section_path": list(unit.get("section_path") or []),
+            }
+            for key in ("table_cells", "table_id", "table_row_index"):
+                if unit.get(key) is not None:
+                    built_unit[key] = unit.get(key)
+
+            text_units.append(built_unit)
 
         text_units = self._promote_contextual_table_rows(text_units)
 

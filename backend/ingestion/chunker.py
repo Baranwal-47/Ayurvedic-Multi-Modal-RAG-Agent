@@ -154,7 +154,7 @@ class Chunker:
             "scripts": scripts,
             "layout_type": str(page_model.get("layout_type") or "single"),
             "route": str(page_model.get("route") or "digitized"),
-            "ocr_source": "vision" if str(page_model.get("route") or "") in {"ocr", "ocr_fallback", "scanned"} else None,
+            "ocr_source": self._resolve_ocr_source(page_model, units),
             "ocr_confidence": page_model.get("quality", {}).get("ocr_confidence"),
             "is_shloka": chunk_type == "shloka",
             "shloka_id": chunk_id if chunk_type == "shloka" else None,
@@ -169,6 +169,22 @@ class Chunker:
             "table_caption": table_caption,
             "table_markdown": table_markdown,
         }
+
+    @staticmethod
+    def _resolve_ocr_source(page_model: dict[str, Any], units: list[dict[str, Any]]) -> str | None:
+        route = str(page_model.get("route") or "")
+        if route in {"ocr", "ocr_fallback", "scanned"}:
+            return "vision"
+
+        if bool(page_model.get("quality", {}).get("hybrid_repair_used_ocr")):
+            return "vision"
+
+        for unit in units:
+            source_engine = str(unit.get("source_engine") or "").strip().lower()
+            if source_engine in {"vision", "ocr"}:
+                return "vision"
+
+        return None
 
     def _make_bridge_chunk(self, previous: dict[str, Any], current: dict[str, Any], chunk_index: int) -> dict[str, Any]:
         merged_text = f"{previous['text']}\n\n{current['text']}".strip()
@@ -242,6 +258,7 @@ class Chunker:
         lower = " ".join(str(text or "").split()).lower()
         if lower.startswith("table "):
             return True
+
         table_row_units = sum(1 for unit in units if str(unit.get("kind") or "") == "table_row")
         if table_row_units >= max(1, len(units) // 2):
             return True
@@ -263,8 +280,11 @@ class Chunker:
         has_serial_prefix = bool(re.match(r"^\d{1,3}[\.)]?\s+", compact))
         if has_serial_prefix and word_count <= 4:
             return True
+        lower = compact.lower()
+        if any(token in lower.split() for token in {"nil", "na", "n/a", "nd"}):
+            return word_count <= 12
         if "%" in compact or "°" in compact:
-            return numeric_tokens >= 2 and word_count <= 12
+            return word_count <= 12 and (numeric_tokens >= 1 or any(token.isalpha() for token in compact.split()))
         if numeric_tokens >= 2 and word_count <= 12:
             return True
         return digit_count >= 6 and word_count <= 12
@@ -273,7 +293,8 @@ class Chunker:
     def _extract_table_rows(units: list[dict[str, Any]]) -> list[list[str]]:
         rows: list[list[str]] = []
         for unit in units:
-            if str(unit.get("kind") or "") != "table_row":
+            text = " ".join(str(unit.get("text") or "").split()).strip()
+            if str(unit.get("kind") or "") != "table_row" and not Chunker._looks_like_table_row(text):
                 continue
 
             raw_cells = unit.get("table_cells")

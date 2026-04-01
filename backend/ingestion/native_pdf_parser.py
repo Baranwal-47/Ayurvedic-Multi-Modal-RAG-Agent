@@ -132,7 +132,15 @@ class NativePDFParser:
         if total == 0:
             return False
 
-        weird = sum(1 for ch in cleaned if not ch.isalnum() and ch not in " \n|.,;:!?-()[]{}'\"/")
+        weird = 0
+        for ch in cleaned:
+            if ch.isalnum() or ch.isspace():
+                continue
+            if ch in " \n|.,;:!?-()[]{}'\"/।॥":
+                continue
+            if unicodedata.category(ch).startswith("M"):
+                continue
+            weird += 1
         devanagari = sum(1 for ch in cleaned if "\u0900" <= ch <= "\u097F")
         arabic = sum(1 for ch in cleaned if "\u0600" <= ch <= "\u06FF")
         telugu = sum(1 for ch in cleaned if "\u0C00" <= ch <= "\u0C7F")

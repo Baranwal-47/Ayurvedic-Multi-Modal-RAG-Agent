@@ -6,10 +6,17 @@ It converts Docling items into the same text-unit shape used by PageModelBuilder
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
+import tempfile
+import time
+from collections.abc import Iterable
 from typing import Any
+
+import fitz
 
 from normalization.diacritic_normalizer import DiacriticNormalizer
 
@@ -22,13 +29,46 @@ class DoclingPageParse:
     table_count: int
 
 
+def plan_page_windows(page_numbers: Iterable[int], batch_size: int) -> list[tuple[int, int]]:
+    """Group requested page numbers into contiguous windows with a maximum size."""
+    numbers = sorted({int(page) for page in page_numbers if int(page) > 0})
+    if not numbers:
+        return []
+
+    batch_size = max(1, int(batch_size))
+    windows: list[tuple[int, int]] = []
+
+    run_start = numbers[0]
+    run_end = numbers[0]
+    for page_number in numbers[1:]:
+        if page_number == run_end + 1:
+            run_end = page_number
+            continue
+
+        windows.extend(_split_window(run_start, run_end, batch_size))
+        run_start = run_end = page_number
+
+    windows.extend(_split_window(run_start, run_end, batch_size))
+    return windows
+
+
+def _split_window(start_page: int, end_page: int, batch_size: int) -> list[tuple[int, int]]:
+    windows: list[tuple[int, int]] = []
+    page = int(start_page)
+    while page <= int(end_page):
+        window_end = min(int(end_page), page + batch_size - 1)
+        windows.append((page, window_end))
+        page = window_end + 1
+    return windows
+
+
 class DoclingPDFParser:
     """Extract page-level text units from Docling, including structured table rows."""
 
     def __init__(self) -> None:
         self.normalizer = DiacriticNormalizer()
         self._converter: Any | None = None
-        self._doc_cache: dict[str, Any] = {}
+        self._page_cache: dict[str, dict[int, DoclingPageParse]] = {}
         self._available = self._detect_availability()
 
     @property
@@ -44,25 +84,166 @@ class DoclingPDFParser:
         except Exception:
             return False
 
+    def prime_document(self, pdf_path: str | Path, page_numbers: Iterable[int] | None = None) -> dict[int, DoclingPageParse]:
+        if not self.available:
+            raise RuntimeError("Docling is not available in the current environment")
+
+        path = Path(pdf_path)
+        key = str(path.resolve())
+        requested_pages = self._normalize_requested_pages(path, page_numbers)
+        cached_pages = self._page_cache.setdefault(key, {})
+        missing_pages = [page_number for page_number in requested_pages if page_number not in cached_pages]
+        if not missing_pages:
+            return cached_pages
+
+        total_pages = self._page_count(path)
+        batch_size = self._resolve_batch_size(total_pages)
+        windows = plan_page_windows(missing_pages, batch_size)
+        print(
+            f"[DOCLING] Priming {path.name}: requested={len(requested_pages)}, missing={len(missing_pages)}, "
+            f"windows={len(windows)}, batch_size={batch_size}"
+        )
+
+        with tempfile.TemporaryDirectory(prefix="docling_batch_") as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            for start_page, end_page in windows:
+                batch_pdf = tmp_root / f"batch_{start_page:04d}_{end_page:04d}.pdf"
+                with fitz.open(path) as src_doc:
+                    with fitz.open() as dst_doc:
+                        dst_doc.insert_pdf(src_doc, from_page=start_page - 1, to_page=end_page - 1)
+                        dst_doc.save(batch_pdf)
+
+                batch_started = time.perf_counter()
+                try:
+                    batch_pages = self._parse_document_pages(batch_pdf, source_file=path.name)
+                except Exception as exc:
+                    print(
+                        f"[DOCLING] Batch {start_page}-{end_page} failed with Docling ({exc}); using PyMuPDF fallback"
+                    )
+                    batch_pages = self._parse_with_pymupdf_pages(
+                        batch_pdf,
+                        source_file=path.name,
+                    )
+                finally:
+                    gc.collect()
+
+                for local_page, parsed_page in batch_pages.items():
+                    global_page = start_page + int(local_page) - 1
+                    if global_page < start_page or global_page > end_page:
+                        continue
+                    remapped_units: list[dict[str, Any]] = []
+                    for unit in parsed_page.text_units:
+                        remapped_unit = dict(unit)
+                        remapped_unit["page_number"] = global_page
+                        unit_id = str(remapped_unit.get("unit_id") or "")
+                        if unit_id:
+                            remapped_unit["unit_id"] = re.sub(
+                                r":p\d+:",
+                                f":p{global_page}:",
+                                unit_id,
+                                count=1,
+                            )
+                        remapped_units.append(remapped_unit)
+                    cached_pages[global_page] = DoclingPageParse(
+                        page_number=global_page,
+                        text_units=remapped_units,
+                        raw_text=parsed_page.raw_text,
+                        table_count=parsed_page.table_count,
+                    )
+
+                for global_page in range(start_page, end_page + 1):
+                    cached_pages.setdefault(
+                        global_page,
+                        DoclingPageParse(page_number=global_page, text_units=[], raw_text="", table_count=0),
+                    )
+
+                print(
+                    f"[DOCLING] Batch {start_page}-{end_page} primed in {time.perf_counter() - batch_started:.2f}s"
+                )
+
+        return cached_pages
+
+    def clear_document(self, pdf_path: str | Path) -> None:
+        key = str(Path(pdf_path).resolve())
+        self._page_cache.pop(key, None)
+
+    def clear_cache(self) -> None:
+        self._page_cache.clear()
+
     def parse_page(self, *, pdf_path: str | Path, page_number: int, source_file: str) -> DoclingPageParse:
         if not self.available:
             raise RuntimeError("Docling is not available in the current environment")
 
         path = Path(pdf_path)
-        doc = self._get_document(path)
-        stem = Path(source_file).stem
-        page_height = self._page_height(doc, page_number)
+        cache = self.prime_document(path, [page_number])
+        parsed = cache.get(int(page_number))
+        if parsed is not None:
+            return parsed
+        return DoclingPageParse(page_number=int(page_number), text_units=[], raw_text="", table_count=0)
 
-        text_units: list[dict[str, Any]] = []
-        raw_parts: list[str] = []
-        table_count = 0
-        seen_table_captions: set[str] = set()
+    def _get_document(self, pdf_path: Path) -> Any:
+        if self._converter is None:
+            from docling.document_converter import DocumentConverter
 
+            self._converter = DocumentConverter()
+
+        result = self._converter.convert(str(pdf_path))
+        return result.document
+
+    def _normalize_requested_pages(self, pdf_path: Path, page_numbers: Iterable[int] | None) -> list[int]:
+        total_pages = self._page_count(pdf_path)
+        if page_numbers is None:
+            return list(range(1, total_pages + 1))
+
+        requested = sorted({int(page) for page in page_numbers if int(page) > 0})
+        for page_number in requested:
+            if page_number > total_pages:
+                raise ValueError(f"page {page_number} out of range 1..{total_pages}")
+        return requested
+
+    @staticmethod
+    def _page_count(pdf_path: Path) -> int:
+        with fitz.open(pdf_path) as doc:
+            return int(doc.page_count)
+
+    @staticmethod
+    def _resolve_batch_size(total_pages: int) -> int:
+        explicit = str(os.getenv("DOCLING_PAGE_BATCH_SIZE", "")).strip()
+        if explicit:
+            try:
+                return max(1, int(explicit))
+            except Exception:
+                print(f"[DOCLING] Invalid DOCLING_PAGE_BATCH_SIZE='{explicit}', using auto mode")
+
+        auto_min_pages = max(1, int(os.getenv("DOCLING_AUTO_BATCH_MIN_PAGES", "25")))
+        auto_batch_size = max(1, int(os.getenv("DOCLING_AUTO_BATCH_SIZE", "25")))
+        if total_pages < auto_min_pages:
+            return max(1, total_pages)
+        return min(max(1, total_pages), auto_batch_size)
+
+    def _parse_document_pages(self, pdf_path: Path, source_file: str | None = None) -> dict[int, DoclingPageParse]:
+        converter = self._get_document(pdf_path)
+        doc = converter
+        file_name = source_file or pdf_path.name
+
+        page_state: dict[int, dict[str, Any]] = {}
         for item, _level in doc.iterate_items():
-            prov = self._get_page_prov(item, page_number)
-            if prov is None:
+            page_number = self._extract_page_number(item)
+            if page_number < 1:
                 continue
 
+            state = page_state.setdefault(
+                page_number,
+                {
+                    "text_units": [],
+                    "raw_parts": [],
+                    "table_count": 0,
+                    "seen_table_captions": set(),
+                },
+            )
+
+            page_height = self._page_height(doc, page_number)
+            prov = self._get_page_prov(item, page_number)
             bbox = self._bbox_from_prov(prov, page_height=page_height)
             label = str(getattr(item, "label", "") or "").lower().strip()
 
@@ -71,27 +252,28 @@ class DoclingPDFParser:
                 if not table_rows:
                     continue
 
-                table_count += 1
-                table_id = f"{stem}:p{page_number}:table:{table_count}"
+                state["table_count"] = int(state["table_count"]) + 1
+                table_id = f"{Path(file_name).stem}:p{page_number}:table:{state['table_count']}"
                 for row_index, row in enumerate(table_rows):
                     cleaned = self._clean_text(str(row.get("text") or ""))
                     if not cleaned:
                         continue
 
                     if bool(row.get("is_caption")):
-                        seen_table_captions.add(self._normalize_table_caption(cleaned))
+                        state["seen_table_captions"].add(self._normalize_table_caption(cleaned))
 
                     cells = [self._clean_text(cell) for cell in list(row.get("cells") or [])]
                     cells = [cell for cell in cells if cell]
-                    raw_parts.append(cleaned)
-                    text_units.append(
+                    state["raw_parts"].append(cleaned)
+                    state["text_units"].append(
                         self._make_unit(
-                            stem=stem,
+                            stem=Path(file_name).stem,
                             page_number=page_number,
-                            index=len(text_units) + 1,
+                            index=len(state["text_units"]) + 1,
                             text=cleaned,
                             kind="table_row",
                             bbox=bbox,
+                            source_engine="docling",
                             extra_fields={
                                 "table_id": table_id,
                                 "table_row_index": int(row_index),
@@ -108,44 +290,71 @@ class DoclingPDFParser:
 
             if label == "caption" and cleaned.lower().startswith("table"):
                 caption_key = self._normalize_table_caption(cleaned)
-                if caption_key in seen_table_captions:
+                if caption_key in state["seen_table_captions"]:
                     continue
 
             kind = self._map_label_to_kind(label=label, text=cleaned)
-            raw_parts.append(cleaned)
-            text_units.append(
+            state["raw_parts"].append(cleaned)
+            state["text_units"].append(
                 self._make_unit(
-                    stem=stem,
+                    stem=Path(file_name).stem,
                     page_number=page_number,
-                    index=len(text_units) + 1,
+                    index=len(state["text_units"]) + 1,
                     text=cleaned,
                     kind=kind,
                     bbox=bbox,
+                    source_engine="docling",
                 )
             )
 
-        return DoclingPageParse(
-            page_number=page_number,
-            text_units=text_units,
-            raw_text="\n".join(raw_parts).strip(),
-            table_count=table_count,
-        )
+        parsed_pages: dict[int, DoclingPageParse] = {}
+        for page_number, state in page_state.items():
+            parsed_pages[page_number] = DoclingPageParse(
+                page_number=page_number,
+                text_units=list(state["text_units"]),
+                raw_text="\n".join(str(part) for part in state["raw_parts"] if str(part).strip()).strip(),
+                table_count=int(state["table_count"]),
+            )
 
-    def _get_document(self, pdf_path: Path) -> Any:
-        key = str(pdf_path.resolve())
-        cached = self._doc_cache.get(key)
-        if cached is not None:
-            return cached
+        return parsed_pages
 
-        if self._converter is None:
-            from docling.document_converter import DocumentConverter
+    def _parse_with_pymupdf_pages(self, pdf_path: Path, source_file: str | None = None) -> dict[int, DoclingPageParse]:
+        parsed_pages: dict[int, DoclingPageParse] = {}
+        file_name = source_file or pdf_path.name
 
-            self._converter = DocumentConverter()
+        with fitz.open(pdf_path) as doc:
+            for page_index, page in enumerate(doc, start=1):
+                text_units: list[dict[str, Any]] = []
+                raw_parts: list[str] = []
 
-        result = self._converter.convert(str(pdf_path))
-        document = result.document
-        self._doc_cache[key] = document
-        return document
+                for index, block in enumerate(page.get_text("blocks", sort=True), start=1):
+                    x0, y0, x1, y1, text, *_rest = block
+                    cleaned = self._clean_text(text)
+                    if not cleaned:
+                        continue
+
+                    block_type = "heading" if self._looks_like_heading(cleaned) else "paragraph"
+                    raw_parts.append(cleaned)
+                    text_units.append(
+                        self._make_unit(
+                            stem=Path(file_name).stem,
+                            page_number=page_index,
+                            index=len(text_units) + 1,
+                            text=cleaned,
+                            kind=block_type,
+                            bbox=[float(x0), float(y0), float(x1), float(y1)],
+                            source_engine="pymupdf",
+                        )
+                    )
+
+                parsed_pages[page_index] = DoclingPageParse(
+                    page_number=page_index,
+                    text_units=text_units,
+                    raw_text="\n".join(raw_parts).strip(),
+                    table_count=0,
+                )
+
+        return parsed_pages
 
     @staticmethod
     def _get_page_prov(item: Any, page_number: int) -> Any | None:
@@ -156,6 +365,15 @@ class DoclingPDFParser:
             if int(getattr(prov, "page_no", 0) or 0) == int(page_number):
                 return prov
         return None
+
+    @staticmethod
+    def _extract_page_number(item: Any) -> int:
+        prov_list = list(getattr(item, "prov", []) or [])
+        if prov_list:
+            page_no = getattr(prov_list[0], "page_no", None)
+            if isinstance(page_no, int) and page_no > 0:
+                return page_no
+        return 1
 
     @staticmethod
     def _bbox_from_prov(prov: Any, *, page_height: float) -> list[float]:
@@ -338,6 +556,7 @@ class DoclingPDFParser:
         text: str,
         kind: str,
         bbox: list[float],
+        source_engine: str = "docling",
         extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         scripts = self._detect_scripts(text)
@@ -354,7 +573,7 @@ class DoclingPDFParser:
             "languages": languages,
             "scripts": scripts,
             "confidence": None,
-            "source_engine": "docling",
+            "source_engine": source_engine,
         }
         if extra_fields:
             unit.update(extra_fields)
@@ -383,3 +602,21 @@ class DoclingPDFParser:
         if "Latn" in scripts:
             return ["en"]
         return ["unknown"]
+
+    @staticmethod
+    def _looks_like_heading(text: str) -> bool:
+        compact = " ".join(str(text or "").split()).strip()
+        if not compact:
+            return False
+
+        if len(compact) <= 80 and compact.isupper():
+            return True
+
+        if len(compact) <= 120 and compact.endswith(":"):
+            return True
+
+        words = compact.split()
+        if len(words) <= 10 and all(word[:1].isupper() for word in words if word and word[0].isalpha()):
+            return True
+
+        return False

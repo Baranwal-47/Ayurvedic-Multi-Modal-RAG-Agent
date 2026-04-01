@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any
 
 import fitz
@@ -45,9 +46,13 @@ class PageClassifier:
         page_number: int,
         native_units: list[dict[str, Any]],
         parser: Any,
+        page: fitz.Page | None = None,
     ) -> PageClassification:
         native_text = "\n".join(str(unit.get("text") or "").strip() for unit in native_units if str(unit.get("text") or "").strip())
-        image_ratio = self._largest_image_ratio_for_page(Path(pdf_path), page_number)
+        if page is not None:
+            image_ratio = self._largest_image_ratio_for_page_from_page(page)
+        else:
+            image_ratio = self._largest_image_ratio_for_page(Path(pdf_path), page_number)
         image_heavy = image_ratio >= self.scanned_image_ratio
         use_ocr, ocr_reason = self.should_use_ocr(native_text, parser)
         native_text_ok = bool(native_text) and not use_ocr
@@ -56,6 +61,8 @@ class PageClassifier:
             return PageClassification(page_number, "scanned", "low_text_high_image", False, True)
         if native_text_ok:
             return PageClassification(page_number, "digitized", "native_good", True, image_heavy)
+        if native_text.strip() and not image_heavy and self._looks_like_index_page(native_text):
+            return PageClassification(page_number, "digitized", "index_like_native", True, image_heavy)
         if native_text.strip():
             return PageClassification(page_number, "ocr_fallback", ocr_reason, False, image_heavy)
         return PageClassification(page_number, "scanned", "empty_native", False, image_heavy)
@@ -99,7 +106,7 @@ class PageClassifier:
         indic_chars = sum(1 for ch in compact if self._is_indic_char(ch))
         mojibake_markers = len(re.findall(r"(?:Ã.|Â.|ï.|à¤|à¥|à¦|à¨|àª|à³)", compact))
         meaningful_words = sum(1 for word in words if self._is_meaningful_token(word))
-        symbol_regex_hit = bool(re.search(r"[^\w\s.,]", compact))
+        symbol_regex_hit = any(self._is_weird_symbol(ch) for ch in compact)
 
         return {
             "symbol_ratio": weird_symbol_chars / total_chars,
@@ -115,7 +122,9 @@ class PageClassifier:
     def _is_weird_symbol(ch: str) -> bool:
         if ch.isalnum() or ch.isspace():
             return False
-        if ch in ".,:;!?()[]{}'\"/-_%+&*#°₹$=|":
+        if ch in ".,:;!?()[]{}'\"/-_%+&*#°₹$=|।॥":
+            return False
+        if unicodedata.category(ch).startswith("M"):
             return False
         return True
 
@@ -167,3 +176,43 @@ class PageClassifier:
                 return float(largest)
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _largest_image_ratio_for_page_from_page(page: fitz.Page) -> float:
+        try:
+            page_area = max(1.0, float(page.rect.width) * float(page.rect.height))
+            largest = 0.0
+            for info in page.get_image_info(xrefs=True):
+                bbox = info.get("bbox")
+                if not bbox:
+                    continue
+                rect = fitz.Rect(bbox)
+                area = max(0.0, float(rect.width)) * max(0.0, float(rect.height))
+                largest = max(largest, area / page_area)
+            return float(largest)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _looks_like_index_page(native_text: str) -> bool:
+        lines = [line.strip() for line in str(native_text or "").splitlines() if line.strip()]
+        if len(lines) < 3:
+            return False
+        return PageClassifier._has_index_entry_pattern(lines)
+
+    @staticmethod
+    def _has_index_entry_pattern(lines: list[str]) -> bool:
+        entry_lines = 0
+        page_range_lines = 0
+
+        for line in lines:
+            compact = " ".join(line.split())
+            if not compact:
+                continue
+
+            if re.search(r"\b\d{1,4}\s*-\s*\d{1,4}\b", compact):
+                page_range_lines += 1
+            if re.match(r"^\d{1,3}\b", compact) and len(compact.split()) <= 8:
+                entry_lines += 1
+
+        return entry_lines >= 2 and page_range_lines >= 2

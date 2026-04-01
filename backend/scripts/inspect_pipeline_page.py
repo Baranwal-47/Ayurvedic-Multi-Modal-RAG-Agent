@@ -9,10 +9,12 @@ The command is python scripts/inspect_pipeline_page.py --pdf data/pdfs/93aa6-145
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import copy
 import gc
 import hashlib
 import json
+import time
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from embeddings.image_embedder import ImageEmbedder
 from embeddings.text_embedder import TextEmbedder
 from ingestion.chunker import Chunker
 from ingestion.docling_parser import DoclingPDFParser
+from ingestion.hybrid_page_repair import HybridPageRepair
 from ingestion.image_extractor import ImageExtractor
 from ingestion.image_text_linker import ImageTextLinker
 from ingestion.native_pdf_parser import NativePDFParser
@@ -106,6 +109,10 @@ def _count_kinds(units: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def _log_stage(label: str, started_at: float) -> None:
+    print(f"[TIMING] {label} took {time.perf_counter() - started_at:.2f}s")
+
+
 def _compact_stage_outputs(page_artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compact: list[dict[str, Any]] = []
     for stage in page_artifacts:
@@ -124,6 +131,15 @@ def _compact_stage_outputs(page_artifacts: list[dict[str, Any]]) -> list[dict[st
                 "word_unit_count": len(ocr_words),
             }
 
+        repair_result = dict(stage.get("repair_result") or {}) if stage.get("repair_result") is not None else None
+        if repair_result is not None:
+            repair_result = {
+                "used_ocr": repair_result.get("used_ocr"),
+                "ocr_profile": repair_result.get("ocr_profile"),
+                "repaired_unit_indexes": repair_result.get("repaired_unit_indexes"),
+                "legacy_repaired_unit_indexes": repair_result.get("legacy_repaired_unit_indexes"),
+            }
+
         pre_noise = dict(stage.get("page_model_pre_noise") or {})
         pre_noise_units = list(pre_noise.get("text_units") or [])
 
@@ -137,6 +153,7 @@ def _compact_stage_outputs(page_artifacts: list[dict[str, Any]]) -> list[dict[st
                     "kind_counts": _count_kinds(native_units),
                 },
                 "docling_result": stage.get("docling_result"),
+                "repair_result": repair_result,
                 "ocr_result": ocr_result,
                 "page_model_pre_noise_summary": {
                     "route": pre_noise.get("route"),
@@ -193,7 +210,6 @@ def main() -> int:
     parser = NativePDFParser()
     docling = DoclingPDFParser()
     classifier = PageClassifier()
-    ocr = OCRPipeline()
     builder = PageModelBuilder()
     layout = PageLayout()
     shloka = ShlokaDetector()
@@ -202,6 +218,10 @@ def main() -> int:
     linker = ImageTextLinker()
     chunker = Chunker()
     mapper = QdrantMapper()
+    repair = HybridPageRepair()
+
+    ocr: OCRPipeline | None = None
+    docling_ready = False
 
     doc_id = _stable_doc_id(pdf_path)
     selected_pages = sorted({int(page) for page in args.pages})
@@ -210,32 +230,88 @@ def main() -> int:
     scanned_pages: set[int] = set()
 
     with fitz.open(pdf_path) as doc:
+        if docling.available:
+            try:
+                priming_started = time.perf_counter()
+                docling.prime_document(pdf_path, page_numbers=selected_pages)
+                docling_ready = True
+                _log_stage(f"docling prime {pdf_path.name}", priming_started)
+            except Exception as exc:
+                docling.clear_document(pdf_path)
+                print(f"[DOCLING] prime failed for {pdf_path.name}; falling back to native parser on digitized pages: {exc}")
+
         for page_number in selected_pages:
             if page_number < 1 or page_number > doc.page_count:
                 raise ValueError(f"page {page_number} out of range 1..{doc.page_count}")
 
             page = doc.load_page(page_number - 1)
+            native_started = time.perf_counter()
             native_page = parser.parse_page(page_number=page_number, page=page, source_file=pdf_path.name)
+            _log_stage(f"native parse page {page_number}", native_started)
+
+            classify_started = time.perf_counter()
             classification = classifier.classify_page(
                 pdf_path=pdf_path,
                 page_number=page_number,
                 native_units=native_page.text_units,
                 parser=parser,
+                page=page,
             )
+            _log_stage(f"classify page {page_number}", classify_started)
 
             ocr_result: dict[str, Any] | None = None
             docling_result: dict[str, Any] | None = None
+            repair_result = None
+
             if classification.page_type == "digitized":
                 selected_units = native_page.text_units
                 structure_engine = "pymupdf"
+                page_quality_updates: dict[str, Any] = {}
 
-                if docling.available:
+                if repair.should_use_hybrid_repair(native_page.text_units, parser):
+                    if ocr is None:
+                        ocr = OCRPipeline()
+                    ocr_profile = repair.select_ocr_profile(native_page.text_units, parser)
+                    ocr_started = time.perf_counter()
+                    ocr_result = ocr.process_page(
+                        pdf_path=pdf_path,
+                        page_number=page_number,
+                        route_reason="garbled",
+                        ocr_profile=ocr_profile,
+                    )
+                    _log_stage(f"ocr hybrid page {page_number}", ocr_started)
+                    repair_result = repair.repair_units(
+                        native_units=native_page.text_units,
+                        ocr_result=ocr_result,
+                        parser=parser,
+                        page_number=page_number,
+                        source_file=pdf_path.name,
+                    )
+                    selected_units = repair_result.text_units
+                    structure_engine = "hybrid_native_vision" if repair_result.used_ocr else "hybrid_native_legacy"
+                    page_quality_updates = {
+                        "hybrid_repair": True,
+                        "hybrid_repair_used_ocr": repair_result.used_ocr,
+                        "hybrid_repair_legacy_units": len(repair_result.legacy_repaired_unit_indexes),
+                        "hybrid_repair_ocr_units": len(repair_result.repaired_unit_indexes),
+                        "ocr_confidence": ocr_result.get("confidence") if repair_result.used_ocr else None,
+                        "repair_mode": "mixed_native_repair",
+                    }
+                    docling_result = {
+                        "used": False,
+                        "reason": "hybrid_repair",
+                        "used_ocr": repair_result.used_ocr,
+                        "ocr_profile": ocr_profile,
+                    }
+                elif docling_ready:
                     try:
+                        docling_started = time.perf_counter()
                         docling_page = docling.parse_page(
                             pdf_path=pdf_path,
                             page_number=page_number,
                             source_file=pdf_path.name,
                         )
+                        _log_stage(f"docling page {page_number}", docling_started)
                         if docling_page.text_units:
                             selected_units = docling_page.text_units
                             structure_engine = "docling"
@@ -247,7 +323,7 @@ def main() -> int:
                     except Exception as exc:
                         docling_result = {"used": False, "error": str(exc)}
                 else:
-                    docling_result = {"used": False, "error": "docling_unavailable"}
+                    docling_result = {"used": False, "error": "docling_not_primed" if docling.available else "docling_unavailable"}
 
                 page_model = builder.build(
                     doc_id=doc_id,
@@ -256,14 +332,25 @@ def main() -> int:
                     route="digitized",
                     native_units=selected_units,
                 )
-                page_model.setdefault("quality", {})["structure_engine"] = structure_engine
+                quality = page_model.setdefault("quality", {})
+                quality["structure_engine"] = structure_engine
+                quality.update(page_quality_updates)
+
             else:
                 scanned_pages.add(page_number)
+                if ocr is None:
+                    ocr = OCRPipeline()
+                ocr_profile = repair.select_ocr_profile(native_page.text_units, parser)
+                ocr_started = time.perf_counter()
                 ocr_result = ocr.process_page(
                     pdf_path=pdf_path,
                     page_number=page_number,
                     route_reason=classification.page_type,
+                    ocr_profile=ocr_profile,
                 )
+                _log_stage(f"ocr page {page_number}", ocr_started)
+                if not ocr_result.get("text_units") and native_page.text_units:
+                    raise RuntimeError(f"OCR failed on page {page_number}")
                 page_model = builder.build(
                     doc_id=doc_id,
                     source_file=pdf_path.name,
@@ -290,6 +377,7 @@ def main() -> int:
                         "text_units": native_page.text_units,
                     },
                     "docling_result": docling_result,
+                    "repair_result": asdict(repair_result) if repair_result is not None else None,
                     "ocr_result": {
                         "engine_used": (ocr_result or {}).get("engine_used"),
                         "confidence": (ocr_result or {}).get("confidence"),
@@ -304,6 +392,10 @@ def main() -> int:
 
             del native_page
             gc.collect()
+
+    if docling.available:
+        docling.clear_document(pdf_path)
+    gc.collect()
 
     page_models = noise.mark_document_noise(page_models)
     section_path: list[str] = []

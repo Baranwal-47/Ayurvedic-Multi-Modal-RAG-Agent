@@ -11,6 +11,8 @@ if str(ROOT) not in sys.path:
 
 from ingestion.chunker import Chunker
 from ingestion.image_extractor import ImageExtractor
+from ingestion.hybrid_page_repair import HybridPageRepair
+from ingestion.docling_parser import plan_page_windows
 from ingestion.native_pdf_parser import NativePDFParser
 from ingestion.noise_detector import NoiseDetector
 from ingestion.page_classifier import PageClassifier
@@ -93,6 +95,31 @@ def test_page_classifier_keeps_valid_devanagari_as_digitized(tmp_path: Path) -> 
     )
 
     assert decision.page_type == "digitized"
+
+
+def test_page_classifier_keeps_index_like_pages_digitized(tmp_path: Path) -> None:
+    pdf_path = _sample_pdf(tmp_path)
+    parser = NativePDFParser()
+    classifier = PageClassifier()
+
+    native_units = [
+        {"text": "19 MANDŪRA", "block_type": "table_row"},
+        {"text": "653-656", "block_type": "paragraph"},
+        {"text": "20 RASAYOGA", "block_type": "table_row"},
+        {"text": "657-740", "block_type": "paragraph"},
+        {"text": "21 LAUHA", "block_type": "table_row"},
+        {"text": "741-756", "block_type": "paragraph"},
+    ]
+
+    decision = classifier.classify_page(
+        pdf_path=pdf_path,
+        page_number=5,
+        native_units=native_units,
+        parser=parser,
+    )
+
+    assert decision.page_type == "digitized"
+    assert decision.reason == "index_like_native"
 
 
 def test_page_model_pipeline_marks_shloka_and_layout() -> None:
@@ -594,3 +621,174 @@ def test_image_extractor_keeps_table_like_candidate_on_scanned_page() -> None:
     )
 
     assert keep is True
+
+
+def test_hybrid_page_repair_replaces_only_suspect_units() -> None:
+    parser = NativePDFParser()
+    repair = HybridPageRepair()
+    garbled_text = "@@@ abc ###"
+
+    native_units = [
+        {
+            "unit_id": "u1",
+            "text": "Chapter 1",
+            "block_type": "heading",
+            "bbox": [0, 0, 100, 10],
+            "reading_order": 0,
+            "source_engine": "pymupdf",
+            "languages": ["en"],
+            "scripts": ["Latn"],
+        },
+        {
+            "unit_id": "u2",
+            "text": garbled_text,
+            "block_type": "paragraph",
+            "bbox": [0, 20, 100, 40],
+            "reading_order": 1,
+            "source_engine": "pymupdf",
+            "languages": ["en"],
+            "scripts": ["Latn"],
+        },
+    ]
+    ocr_result = {
+        "text": "Chapter 1\nRecovered shloka text",
+        "confidence": 0.91,
+        "text_units": [
+            {
+                "unit_id": "ocr1",
+                "text": "Recovered shloka text",
+                "bbox": [0, 20, 100, 40],
+                "reading_order": 0,
+                "source_engine": "vision",
+                "confidence": 0.91,
+            }
+        ],
+    }
+
+    assert repair.should_use_hybrid_repair(native_units, parser) is True
+
+    result = repair.repair_units(
+        native_units=native_units,
+        ocr_result=ocr_result,
+        parser=parser,
+        page_number=1,
+        source_file="sample.pdf",
+    )
+
+    assert result.used_ocr is True
+    assert result.repaired_unit_indexes == [1]
+    assert result.legacy_repaired_unit_indexes == []
+    assert result.text_units[0]["text"] == "Chapter 1"
+    assert result.text_units[1]["text"] == "Recovered shloka text"
+    assert result.text_units[1]["source_engine"] == "vision"
+    assert result.text_units[1]["scripts"] == ["Latn"]
+
+
+def test_hybrid_page_repair_uses_legacy_font_map_before_ocr() -> None:
+    parser = NativePDFParser()
+    garbled_text = "@@@ abc ###"
+    repair = HybridPageRepair(legacy_font_map={garbled_text: "वातः"})
+
+    native_units = [
+        {
+            "unit_id": "u1",
+            "text": garbled_text,
+            "block_type": "paragraph",
+            "bbox": [0, 0, 100, 10],
+            "reading_order": 0,
+            "source_engine": "pymupdf",
+        }
+    ]
+
+    result = repair.repair_units(
+        native_units=native_units,
+        ocr_result={"text": "", "confidence": 0.0, "text_units": []},
+        parser=parser,
+        page_number=1,
+        source_file="sample.pdf",
+    )
+
+    assert result.used_ocr is False
+    assert result.legacy_repaired_unit_indexes == [0]
+    assert result.repaired_unit_indexes == []
+    assert result.text_units[0]["text"] == "वातः"
+    assert result.text_units[0]["source_engine"] == "legacy_font_map"
+    assert result.text_units[0]["scripts"] == ["Deva"]
+
+
+def test_chunker_marks_hybrid_ocr_source_only_when_ocr_used() -> None:
+    chunker = Chunker(target_words=400, hard_cap_words=400)
+    page_models = [
+        {
+            "doc_id": "doc1",
+            "source_file": "sample.pdf",
+            "page_number": 1,
+            "route": "digitized",
+            "layout_type": "single",
+            "section_path": [],
+            "quality": {"ocr_confidence": 0.91, "hybrid_repair_used_ocr": True},
+            "images": [],
+            "text_units": [
+                {
+                    "unit_id": "u1",
+                    "kind": "heading",
+                    "text": "Chapter 1",
+                    "reading_order": 0,
+                    "languages": ["en"],
+                    "scripts": ["Latn"],
+                    "source_engine": "pymupdf",
+                },
+                {
+                    "unit_id": "u2",
+                    "kind": "paragraph",
+                    "text": "Recovered text",
+                    "reading_order": 1,
+                    "languages": ["en"],
+                    "scripts": ["Latn"],
+                    "source_engine": "vision",
+                },
+            ],
+        }
+    ]
+
+    chunks = chunker.chunk_document(page_models)
+    assert chunks
+    assert chunks[0]["ocr_source"] == "vision"
+
+    page_models[0]["quality"]["hybrid_repair_used_ocr"] = False
+    page_models[0]["text_units"][1]["source_engine"] = "legacy_font_map"
+    chunks = chunker.chunk_document(page_models)
+    assert chunks
+    assert chunks[0]["ocr_source"] is None
+
+
+def test_page_model_builder_preserves_table_cells() -> None:
+    builder = PageModelBuilder()
+    page_model = builder.build(
+        doc_id="doc1",
+        source_file="sample.pdf",
+        page_number=1,
+        route="digitized",
+        native_units=[
+            {
+                "unit_id": "u1",
+                "text": "Table No. 1",
+                "block_type": "table_row",
+                "bbox": [0, 0, 100, 10],
+                "reading_order": 0,
+                "source_engine": "docling",
+                "table_cells": ["Table No. 1"],
+                "table_id": "doc1:p1:table:1",
+                "table_row_index": 0,
+            }
+        ],
+    )
+
+    unit = page_model["text_units"][0]
+    assert unit["table_cells"] == ["Table No. 1"]
+    assert unit["table_id"] == "doc1:p1:table:1"
+    assert unit["table_row_index"] == 0
+
+
+def test_plan_page_windows_groups_contiguous_ranges() -> None:
+    assert plan_page_windows([1, 2, 3, 6, 7, 10], batch_size=2) == [(1, 2), (3, 3), (6, 7), (10, 10)]
