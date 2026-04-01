@@ -6,7 +6,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 import cloudinary
 import cloudinary.api
@@ -76,6 +76,11 @@ class CloudinaryUploader:
         figure = max(1, int(figure_index or 1))
         return f"{self.upload_folder}/{safe_stem}/page_{page}/figure_{figure}"
 
+    def build_document_prefix(self, source_file: str) -> str:
+        source_stem = Path(str(source_file or "")).stem
+        safe_stem = self._slug(source_stem) or "unknown_source"
+        return f"{self.upload_folder}/{safe_stem}"
+
     def upload_image(self, file_path: str | Path, public_id: str) -> tuple[str, str]:
         path = Path(file_path)
         if not path.exists():
@@ -129,11 +134,26 @@ class CloudinaryUploader:
     def _get_existing_asset(self, public_id: str) -> dict | None:
         """Return Cloudinary resource metadata when asset already exists, else None."""
         try:
+            result = cloudinary.api.resource(
+                public_id,
+                resource_type="image",
+                timeout=self._timeout_sec(),
+            )
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                return None
+            raise
+        return result if isinstance(result, dict) else None
+
+    def delete_document_assets(self, source_file: str) -> dict[str, Any] | None:
+        prefix = self.build_document_prefix(source_file)
+        try:
             result = self._retry_call(
-                operation_label=f"resource lookup public_id={public_id}",
-                fn=lambda: cloudinary.api.resource(
-                    public_id,
+                operation_label=f"delete prefix={prefix}",
+                fn=lambda: cloudinary.api.delete_resources_by_prefix(
+                    prefix,
                     resource_type="image",
+                    invalidate=True,
                     timeout=self._timeout_sec(),
                 ),
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import os
@@ -23,7 +24,6 @@ from embeddings.text_embedder import TextEmbedder
 from ingestion.chunker import Chunker
 from ingestion.cloudinary_uploader import CloudinaryUploader
 from ingestion.docling_parser import DoclingPDFParser
-from ingestion.hybrid_page_repair import HybridPageRepair
 from ingestion.image_extractor import ImageExtractor
 from ingestion.image_text_linker import ImageTextLinker
 from ingestion.native_pdf_parser import NativePDFParser
@@ -51,12 +51,52 @@ def _log_stage(label: str, started_at: float) -> None:
     _log(f"[TIMING] {label} took {time.perf_counter() - started_at:.2f}s")
 
 
+class _TeeStream:
+    def __init__(self, terminal_stream) -> None:
+        self.terminal_stream = terminal_stream
+        self.log_stream = None
+
+    def set_log_stream(self, stream) -> None:
+        self.log_stream = stream
+
+    def clear_log_stream(self) -> None:
+        self.log_stream = None
+
+    def write(self, data: str) -> int:
+        self.terminal_stream.write(data)
+        log_stream = self.log_stream
+        if log_stream is not None and not getattr(log_stream, "closed", False):
+            log_stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.terminal_stream.flush()
+        log_stream = self.log_stream
+        if log_stream is not None and not getattr(log_stream, "closed", False):
+            log_stream.flush()
+
+
+_STDOUT_ROUTER = _TeeStream(sys.stdout)
+_STDERR_ROUTER = _TeeStream(sys.stderr)
+
+
+def _document_log_path(run_state: RunState, doc_id: str) -> Path:
+    return run_state.root_dir / f"{doc_id}.log"
+
+
+def _cleanup_document_artifacts(*, doc_id: str, pdf_path: Path, qdrant: QdrantManager, cloudinary_uploader: CloudinaryUploader) -> None:
+    qdrant.delete_by_doc_id(doc_id)
+    cloudinary_uploader.delete_document_assets(pdf_path.name)
+
+
 def _run_with_retries(*, label: str, fn, retries: int, wait_sec: float):
     attempts = max(1, int(retries))
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except Exception:
+        except Exception as exc:
+            if attempt < attempts:
+                _log(f"[RETRY] {label} attempt {attempt}/{attempts} failed: {exc}")
             if attempt >= attempts:
                 raise
             time.sleep(float(wait_sec) * attempt)
@@ -131,140 +171,152 @@ def _collect_page_models(pdf_path: Path, doc_id: str, run_state: RunState) -> tu
     builder = PageModelBuilder()
     layout = PageLayout()
     shloka = ShlokaDetector()
-    repair = HybridPageRepair()
 
     ocr: OCRPipeline | None = None
     docling_ready = False
+    docling_targets: set[int] = set()
+    decision_rows: list[dict[str, Any]] = []
 
     page_models: list[dict[str, Any]] = []
     scanned_pages: set[int] = set()
 
     try:
         with fitz.open(pdf_path) as doc:
-            total_pages = int(doc.page_count)
+            for page_number, page in enumerate(doc, start=1):
+                native_started = time.perf_counter()
+                native_page = parser.parse_page(page_number=page_number, page=page, source_file=pdf_path.name)
+                _log_stage(f"native parse page {page_number}", native_started)
 
-            if docling.available:
+                classify_started = time.perf_counter()
+                classification = classifier.classify_page(
+                    pdf_path=pdf_path,
+                    page_number=page_number,
+                    native_units=native_page.text_units,
+                    parser=parser,
+                    page=page,
+                )
+                _log_stage(f"classify page {page_number}", classify_started)
+
+                native_text = "\n".join(
+                    str(unit.get("text") or "").strip() for unit in native_page.text_units if str(unit.get("text") or "").strip()
+                )
+                use_ocr, ocr_reason = classifier.should_use_ocr(native_text, parser)
+
+                route = "native"
+                route_reason = "native_clean"
+                if not native_text.strip():
+                    route = "ocr"
+                    route_reason = "empty_native"
+                elif use_ocr:
+                    route = "ocr"
+                    route_reason = ocr_reason
+                elif classification.page_type != "digitized":
+                    route = "ocr"
+                    route_reason = classification.reason
+                else:
+                    use_docling, docling_reason = classifier.should_use_docling(native_page.text_units)
+                    if use_docling:
+                        route = "docling"
+                        route_reason = docling_reason
+                        docling_targets.add(page_number)
+
+                if route == "ocr":
+                    scanned_pages.add(page_number)
+
+                _log(f"[ROUTER] page {page_number}: route={route} reason={route_reason}")
+                decision_rows.append(
+                    {
+                        "page_number": page_number,
+                        "native_page": native_page,
+                        "classification": classification,
+                        "route": route,
+                        "route_reason": route_reason,
+                    }
+                )
+
+            if docling.available and docling_targets:
                 try:
                     priming_started = time.perf_counter()
-                    docling.prime_document(pdf_path, page_numbers=range(1, total_pages + 1))
+                    docling.prime_document(pdf_path, page_numbers=sorted(docling_targets))
                     docling_ready = True
-                    _log_stage(f"docling prime {pdf_path.name}", priming_started)
+                    _log_stage(f"docling prime selective {pdf_path.name}", priming_started)
                 except Exception as exc:
                     docling.clear_document(pdf_path)
-                    _log(f"[DOCLING] prime failed for {pdf_path.name}; falling back to native parser on digitized pages: {exc}")
+                    docling_ready = False
+                    _log(f"[DOCLING] selective prime failed for {pdf_path.name}; falling back to native parser: {exc}")
 
-            for page_number, page in enumerate(doc, start=1):
-                try:
-                    native_started = time.perf_counter()
-                    native_page = parser.parse_page(page_number=page_number, page=page, source_file=pdf_path.name)
-                    _log_stage(f"native parse page {page_number}", native_started)
+        for decision in decision_rows:
+            page_number = int(decision["page_number"])
+            native_page = decision["native_page"]
+            classification = decision["classification"]
+            route = str(decision["route"])
+            route_reason = str(decision["route_reason"])
 
-                    classify_started = time.perf_counter()
-                    classification = classifier.classify_page(
+            try:
+                if route == "ocr":
+                    if ocr is None:
+                        ocr = OCRPipeline()
+                    ocr_started = time.perf_counter()
+                    ocr_result = ocr.process_page(
                         pdf_path=pdf_path,
                         page_number=page_number,
-                        native_units=native_page.text_units,
-                        parser=parser,
-                        page=page,
+                        route_reason=classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback",
+                        ocr_profile="default",
                     )
-                    _log_stage(f"classify page {page_number}", classify_started)
+                    _log_stage(f"ocr page {page_number}", ocr_started)
+                    if not ocr_result.get("text_units") and native_page.text_units:
+                        raise RuntimeError(f"OCR failed on page {page_number}")
 
-                    if classification.page_type == "digitized":
-                        selected_units = native_page.text_units
-                        structure_engine = "pymupdf"
-                        page_quality_updates: dict[str, Any] = {}
+                    ocr_route = classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback"
+                    page_model = builder.build(
+                        doc_id=doc_id,
+                        source_file=pdf_path.name,
+                        page_number=page_number,
+                        route=ocr_route,
+                        ocr_units=ocr_result.get("text_units") or [],
+                        ocr_confidence=ocr_result.get("confidence"),
+                    )
+                    quality = page_model.setdefault("quality", {})
+                    quality["structure_engine"] = "vision"
+                    quality["route_reason"] = route_reason
+                else:
+                    selected_units = native_page.text_units
+                    structure_engine = "pymupdf"
 
-                        if repair.should_use_hybrid_repair(native_page.text_units, parser):
-                            if ocr is None:
-                                ocr = OCRPipeline()
-                            ocr_profile = repair.select_ocr_profile(native_page.text_units, parser)
-                            ocr_started = time.perf_counter()
-                            ocr_result = ocr.process_page(
+                    if route == "docling" and docling_ready:
+                        try:
+                            docling_started = time.perf_counter()
+                            docling_page = docling.parse_page(
                                 pdf_path=pdf_path,
-                                page_number=page_number,
-                                route_reason="garbled",
-                                ocr_profile=ocr_profile,
-                            )
-                            _log_stage(f"ocr hybrid page {page_number}", ocr_started)
-
-                            repair_result = repair.repair_units(
-                                native_units=native_page.text_units,
-                                ocr_result=ocr_result,
-                                parser=parser,
                                 page_number=page_number,
                                 source_file=pdf_path.name,
                             )
-                            selected_units = repair_result.text_units
-                            structure_engine = "hybrid_native_vision" if repair_result.used_ocr else "hybrid_native_legacy"
-                            page_quality_updates.update(
-                                {
-                                    "hybrid_repair": True,
-                                    "hybrid_repair_used_ocr": repair_result.used_ocr,
-                                    "hybrid_repair_legacy_units": len(repair_result.legacy_repaired_unit_indexes),
-                                    "hybrid_repair_ocr_units": len(repair_result.repaired_unit_indexes),
-                                    "ocr_confidence": ocr_result.get("confidence") if repair_result.used_ocr else None,
-                                    "repair_mode": "mixed_native_repair",
-                                }
-                            )
-                        elif docling_ready:
-                            try:
-                                docling_started = time.perf_counter()
-                                docling_page = docling.parse_page(
-                                    pdf_path=pdf_path,
-                                    page_number=page_number,
-                                    source_file=pdf_path.name,
-                                )
-                                _log_stage(f"docling page {page_number}", docling_started)
-                                if docling_page.text_units:
-                                    selected_units = docling_page.text_units
-                                    structure_engine = "docling"
-                            except Exception as exc:
-                                _log(f"[DOCLING] page {page_number} fallback to native parser: {exc}")
+                            _log_stage(f"docling page {page_number}", docling_started)
+                            if docling_page.text_units:
+                                selected_units = docling_page.text_units
+                                structure_engine = "docling"
+                        except Exception as exc:
+                            _log(f"[DOCLING] page {page_number} fallback to native parser: {exc}")
 
-                        page_model = builder.build(
-                            doc_id=doc_id,
-                            source_file=pdf_path.name,
-                            page_number=page_number,
-                            route="digitized",
-                            native_units=selected_units,
-                        )
-                        quality = page_model.setdefault("quality", {})
-                        quality["structure_engine"] = structure_engine
-                        quality.update(page_quality_updates)
-                    else:
-                        scanned_pages.add(page_number)
-                        if ocr is None:
-                            ocr = OCRPipeline()
-                        ocr_profile = repair.select_ocr_profile(native_page.text_units, parser)
-                        ocr_started = time.perf_counter()
-                        ocr_result = ocr.process_page(
-                            pdf_path=pdf_path,
-                            page_number=page_number,
-                            route_reason=classification.page_type,
-                            ocr_profile=ocr_profile,
-                        )
-                        _log_stage(f"ocr page {page_number}", ocr_started)
-                        if not ocr_result.get("text_units") and native_page.text_units:
-                            raise RuntimeError(f"OCR failed on page {page_number}")
-                        page_model = builder.build(
-                            doc_id=doc_id,
-                            source_file=pdf_path.name,
-                            page_number=page_number,
-                            route=classification.page_type,
-                            ocr_units=ocr_result.get("text_units") or [],
-                            ocr_confidence=ocr_result.get("confidence"),
-                        )
+                    page_model = builder.build(
+                        doc_id=doc_id,
+                        source_file=pdf_path.name,
+                        page_number=page_number,
+                        route="digitized",
+                        native_units=selected_units,
+                    )
+                    quality = page_model.setdefault("quality", {})
+                    quality["structure_engine"] = structure_engine
+                    quality["route_reason"] = route_reason
 
-                    page_model = layout.apply(page_model)
-                    page_model = shloka.apply(page_model)
-                    page_models.append(page_model)
-                except Exception as exc:
-                    run_state.mark_page_failed(doc_id, int(page_number), str(exc))
-                    raise
-                finally:
-                    if "native_page" in locals():
-                        del native_page
-                    gc.collect()
+                page_model = layout.apply(page_model)
+                page_model = shloka.apply(page_model)
+                page_models.append(page_model)
+            except Exception as exc:
+                run_state.mark_page_failed(doc_id, page_number, str(exc))
+                raise
+            finally:
+                gc.collect()
     finally:
         if docling.available:
             docling.clear_document(pdf_path)
@@ -369,39 +421,48 @@ def ingest_pdf(
             "skipped": True,
         }
 
+    _cleanup_document_artifacts(doc_id=doc_id, pdf_path=pdf_path, qdrant=qdrant, cloudinary_uploader=cloudinary_uploader)
+
     run_state.start_document(doc_id)
 
     image_output_dir = image_output_root / pdf_path.stem
     image_output_dir.mkdir(parents=True, exist_ok=True)
 
-    page_models, scanned_pages = _collect_page_models(pdf_path, doc_id, run_state)
-    _attach_images(
-        pdf_path=pdf_path,
-        image_output_dir=image_output_dir,
-        page_models=page_models,
-        scanned_pages=scanned_pages,
-    )
-
-    chunks = Chunker().chunk_document(page_models)
-    images = _upload_images(page_models=page_models, uploader=cloudinary_uploader, run_state=run_state)
-
-    for image in images:
-        linked_chunk_ids = [chunk["chunk_id"] for chunk in chunks if image["image_id"] in chunk.get("image_ids", [])]
-        image["linked_chunk_ids"] = linked_chunk_ids
-
-    text_vectors = text_embedder.embed([chunk["text_for_embedding"] for chunk in chunks])
-    image_vectors = image_embedder.embed([image.get("caption") or image.get("surrounding_text") or image["image_id"] for image in images])
-
-    mapper = QdrantMapper()
-    text_points = mapper.map_text_points(chunks, text_vectors)
-    image_points = mapper.map_image_points(images, image_vectors)
-
-    qdrant.delete_by_doc_id(doc_id)
     try:
-        qdrant.upsert_text_chunks(text_points)
-        qdrant.upsert_image_chunks(image_points)
+        page_models, scanned_pages = _collect_page_models(pdf_path, doc_id, run_state)
+        _attach_images(
+            pdf_path=pdf_path,
+            image_output_dir=image_output_dir,
+            page_models=page_models,
+            scanned_pages=scanned_pages,
+        )
+
+        chunks = Chunker().chunk_document(page_models)
+        images = _upload_images(page_models=page_models, uploader=cloudinary_uploader, run_state=run_state)
+
+        for image in images:
+            linked_chunk_ids = [chunk["chunk_id"] for chunk in chunks if image["image_id"] in chunk.get("image_ids", [])]
+            image["linked_chunk_ids"] = linked_chunk_ids
+
+        text_vectors = text_embedder.embed([chunk["text_for_embedding"] for chunk in chunks])
+        image_vectors = image_embedder.embed([image.get("caption") or image.get("surrounding_text") or image["image_id"] for image in images])
+
+        mapper = QdrantMapper()
+        text_points = mapper.map_text_points(chunks, text_vectors)
+        image_points = mapper.map_image_points(images, image_vectors)
+
+        _run_with_retries(
+            label=f"qdrant upsert for {pdf_path.name}",
+            fn=lambda: (qdrant.upsert_text_chunks(text_points), qdrant.upsert_image_chunks(image_points)),
+            retries=int(os.getenv("QDRANT_UPSERT_RETRIES", "3")),
+            wait_sec=float(os.getenv("QDRANT_UPSERT_RETRY_WAIT_SEC", "2")),
+        )
     except Exception:
         qdrant.delete_by_doc_id(doc_id)
+        try:
+            cloudinary_uploader.delete_document_assets(pdf_path.name)
+        except Exception as cleanup_exc:
+            _log(f"[CLEANUP] Cloudinary cleanup failed for {pdf_path.name}: {cleanup_exc}")
         raise
 
     for page_model in page_models:
@@ -447,24 +508,30 @@ def main() -> int:
 
     summaries: list[dict[str, Any]] = []
     for pdf in pdfs:
-        _log(f"[INGEST] Starting {pdf.name}")
-        summaries.append(
-            _run_with_retries(
-                label=pdf.name,
-                fn=lambda p=pdf: ingest_pdf(
-                    pdf_path=p,
-                    qdrant=qdrant,
-                    text_embedder=text_embedder,
-                    image_embedder=image_embedder,
-                    cloudinary_uploader=uploader,
-                    image_output_root=args.image_output_dir,
-                    run_state=run_state,
-                ),
-                retries=int(os.getenv("QDRANT_UPSERT_RETRIES", "3")),
-                wait_sec=float(os.getenv("QDRANT_UPSERT_RETRY_WAIT_SEC", "2")),
-            )
-        )
-        _log(f"[INGEST] Completed {pdf.name}")
+        doc_id = _stable_doc_id(pdf)
+        log_path = _document_log_path(run_state, doc_id)
+        with log_path.open("w", encoding="utf-8") as log_file:
+            _STDOUT_ROUTER.set_log_stream(log_file)
+            _STDERR_ROUTER.set_log_stream(log_file)
+            try:
+                with contextlib.redirect_stdout(_STDOUT_ROUTER), contextlib.redirect_stderr(_STDERR_ROUTER):
+                    _log(f"[INGEST] Starting {pdf.name}")
+                    _log(f"[INGEST] Log file: {log_path}")
+                    summaries.append(
+                        ingest_pdf(
+                            pdf_path=pdf,
+                            qdrant=qdrant,
+                            text_embedder=text_embedder,
+                            image_embedder=image_embedder,
+                            cloudinary_uploader=uploader,
+                            image_output_root=args.image_output_dir,
+                            run_state=run_state,
+                        )
+                    )
+                    _log(f"[INGEST] Completed {pdf.name}")
+            finally:
+                _STDOUT_ROUTER.clear_log_stream()
+                _STDERR_ROUTER.clear_log_stream()
 
     print("\n=== Ingestion Summary ===")
     for summary in summaries:

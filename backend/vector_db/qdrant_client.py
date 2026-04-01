@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
@@ -102,7 +103,7 @@ class QdrantManager:
             collection_name=self.text_collection,
             points=[
                 PointStruct(
-                    id=point["id"],
+                    id=self._normalize_point_id(point["id"], kind="text"),
                     vector={
                         "dense": point["dense_vector"],
                         "sparse": SparseVector(indices=point["sparse_indices"], values=point["sparse_values"]),
@@ -120,7 +121,7 @@ class QdrantManager:
             collection_name=self.image_collection,
             points=[
                 PointStruct(
-                    id=point["id"],
+                    id=self._normalize_point_id(point["id"], kind="image"),
                     vector={"dense": point["dense_vector"]},
                     payload=point["payload"],
                 )
@@ -220,3 +221,17 @@ class QdrantManager:
         if not resolved:
             raise ValueError(f"Unknown collection '{collection}'")
         return resolved
+
+    @staticmethod
+    def _normalize_point_id(point_id: object, *, kind: str) -> str | int:
+        if isinstance(point_id, int):
+            return point_id
+
+        raw = str(point_id or "").strip()
+        if not raw:
+            raise ValueError("Point id cannot be empty")
+
+        try:
+            return str(uuid.UUID(raw))
+        except Exception:
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{kind}:{raw}"))

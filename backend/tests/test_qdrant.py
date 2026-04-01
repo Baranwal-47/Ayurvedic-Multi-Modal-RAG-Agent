@@ -5,12 +5,22 @@ from __future__ import annotations
 import os
 import random
 import sys
+import uuid
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vector_db.qdrant_client import QdrantManager
 
 DENSE_DIM = 1024
+
+
+def test_0_point_id_normalization():
+    normalized_text = QdrantManager._normalize_point_id("b6a7db2cfb401fff:p1-1:paragraph:1", kind="text")
+    normalized_image = QdrantManager._normalize_point_id("b6a7db2cfb401fff:p1:img:1", kind="image")
+
+    uuid.UUID(str(normalized_text))
+    uuid.UUID(str(normalized_image))
+    assert normalized_text != normalized_image
 
 
 def random_vector():

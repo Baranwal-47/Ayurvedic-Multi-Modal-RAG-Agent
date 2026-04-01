@@ -215,8 +215,9 @@ class DoclingPDFParser:
             except Exception:
                 print(f"[DOCLING] Invalid DOCLING_PAGE_BATCH_SIZE='{explicit}', using auto mode")
 
-        auto_min_pages = max(1, int(os.getenv("DOCLING_AUTO_BATCH_MIN_PAGES", "25")))
-        auto_batch_size = max(1, int(os.getenv("DOCLING_AUTO_BATCH_SIZE", "25")))
+        # Keep the default window conservative because Docling OCR rendering can spike memory on large PDFs.
+        auto_min_pages = max(1, int(os.getenv("DOCLING_AUTO_BATCH_MIN_PAGES", "12")))
+        auto_batch_size = max(1, int(os.getenv("DOCLING_AUTO_BATCH_SIZE", "8")))
         if total_pages < auto_min_pages:
             return max(1, total_pages)
         return min(max(1, total_pages), auto_batch_size)

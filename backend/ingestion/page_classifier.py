@@ -95,6 +95,26 @@ class PageClassifier:
             return True, "quality:" + ",".join(reasons)
         return False, "native_good"
 
+    def should_use_docling(self, native_units: list[dict[str, Any]]) -> tuple[bool, str]:
+        """Return True when native page content is likely table-heavy or structurally complex."""
+        rows = [" ".join(str((unit or {}).get("text") or "").split()).strip() for unit in native_units]
+        rows = [row for row in rows if row]
+        if not rows:
+            return False, "no_native_text"
+
+        table_anchor_hits = sum(1 for row in rows if self._has_table_anchor(row))
+        row_pattern_hits = sum(1 for row in rows if self._looks_like_table_row_text(row))
+        numeric_dense_hits = sum(1 for row in rows if self._is_numeric_dense_row(row))
+        two_columnish = self._is_two_columnish(native_units)
+
+        if table_anchor_hits >= 1 and row_pattern_hits >= 1:
+            return True, "table_anchor"
+        if row_pattern_hits >= 3:
+            return True, "table_rows"
+        if two_columnish and (row_pattern_hits >= 1 or numeric_dense_hits >= 2):
+            return True, "complex_layout"
+        return False, "simple_layout"
+
     def _analyze_text_quality(self, text: str) -> dict[str, float | bool]:
         compact = " ".join(str(text or "").split())
         total_chars = max(1, len(compact))
@@ -117,6 +137,69 @@ class PageClassifier:
             "symbol_regex_hit": symbol_regex_hit,
             "too_short": len(compact) < self.min_native_chars,
         }
+
+    @staticmethod
+    def _has_table_anchor(text: str) -> bool:
+        lower = str(text or "").lower()
+        return bool(
+            re.search(r"\btable\b", lower)
+            or re.search(r"\bs\.?\s*no\b", lower)
+            or "sample no" in lower
+            or "parameter" in lower
+        )
+
+    @staticmethod
+    def _looks_like_table_row_text(text: str) -> bool:
+        compact = " ".join(str(text or "").split())
+        if not compact:
+            return False
+        if re.match(r"^\d{1,3}[\.)]?\s+", compact):
+            return True
+        if "|" in compact:
+            return True
+        numeric_tokens = len(re.findall(r"\d+(?:\.\d+)?", compact))
+        word_count = len(compact.split())
+        return numeric_tokens >= 2 and word_count <= 12
+
+    @staticmethod
+    def _is_numeric_dense_row(text: str) -> bool:
+        compact = " ".join(str(text or "").split())
+        if not compact:
+            return False
+        letters = sum(1 for ch in compact if ch.isalpha())
+        digits = sum(1 for ch in compact if ch.isdigit())
+        if letters + digits == 0:
+            return False
+        ratio = digits / (letters + digits)
+        return ratio >= 0.35 and len(compact.split()) <= 14
+
+    @staticmethod
+    def _is_two_columnish(native_units: list[dict[str, Any]]) -> bool:
+        centers: list[float] = []
+        for unit in native_units:
+            bbox = (unit or {}).get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            try:
+                x0 = float(bbox[0])
+                x1 = float(bbox[2])
+            except Exception:
+                continue
+            centers.append((x0 + x1) / 2.0)
+
+        if len(centers) < 6:
+            return False
+
+        ordered = sorted(centers)
+        midpoint = ordered[len(ordered) // 2]
+        left = sum(1 for x in centers if x <= midpoint)
+        right = len(centers) - left
+        spread = max(centers) - min(centers)
+
+        if spread < 120.0:
+            return False
+        min_side = max(2, int(len(centers) * 0.25))
+        return left >= min_side and right >= min_side
 
     @staticmethod
     def _is_weird_symbol(ch: str) -> bool:
