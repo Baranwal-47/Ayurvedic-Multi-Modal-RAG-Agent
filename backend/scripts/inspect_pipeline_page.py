@@ -9,7 +9,6 @@ The command is python scripts/inspect_pipeline_page.py --pdf data/pdfs/93aa6-145
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import copy
 import gc
 import hashlib
@@ -29,7 +28,6 @@ from embeddings.image_embedder import ImageEmbedder
 from embeddings.text_embedder import TextEmbedder
 from ingestion.chunker import Chunker
 from ingestion.docling_parser import DoclingPDFParser
-from ingestion.hybrid_page_repair import HybridPageRepair
 from ingestion.image_extractor import ImageExtractor
 from ingestion.image_text_linker import ImageTextLinker
 from ingestion.native_pdf_parser import NativePDFParser
@@ -122,13 +120,22 @@ def _compact_stage_outputs(page_artifacts: list[dict[str, Any]]) -> list[dict[st
         ocr_result = dict(stage.get("ocr_result") or {}) if stage.get("ocr_result") is not None else None
         if ocr_result is not None:
             ocr_units = list(ocr_result.get("text_units") or [])
+            ocr_line_units = list(ocr_result.get("line_units") or [])
+            ocr_effective_units = list(ocr_result.get("effective_units") or [])
             ocr_words = list(ocr_result.get("word_units") or [])
+            effective_units = ocr_effective_units or ocr_line_units or ocr_units
             ocr_result = {
                 "engine_used": ocr_result.get("engine_used"),
                 "confidence": ocr_result.get("confidence"),
                 "text": ocr_result.get("text"),
                 "text_unit_count": len(ocr_units),
+                "line_unit_count": len(ocr_line_units),
                 "word_unit_count": len(ocr_words),
+                "effective_unit_count": len(effective_units),
+                "effective_unit_granularity": str(
+                    ocr_result.get("effective_unit_granularity")
+                    or ("line" if ocr_line_units else "paragraph")
+                ),
             }
 
         repair_result = dict(stage.get("repair_result") or {}) if stage.get("repair_result") is not None else None
@@ -146,6 +153,7 @@ def _compact_stage_outputs(page_artifacts: list[dict[str, Any]]) -> list[dict[st
         compact.append(
             {
                 "page_number": stage.get("page_number"),
+                "router_decision": stage.get("router_decision"),
                 "classification": stage.get("classification"),
                 "native_parse": {
                     "raw_text": native_parse.get("raw_text"),
@@ -196,6 +204,16 @@ def _compact_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return compact
 
 
+def _chunk_fragmentation_stats(chunks: list[dict[str, Any]], page_models: list[dict[str, Any]]) -> tuple[float, str | None]:
+    page_count = max(1, len(page_models))
+    avg_chunks_per_page = float(len(chunks)) / float(page_count)
+    if avg_chunks_per_page >= 40.0:
+        return avg_chunks_per_page, "critical_fragmentation"
+    if avg_chunks_per_page >= 30.0:
+        return avg_chunks_per_page, "high_fragmentation"
+    return avg_chunks_per_page, None
+
+
 def main() -> int:
     args = _parse_args()
     pdf_path = args.pdf
@@ -218,10 +236,11 @@ def main() -> int:
     linker = ImageTextLinker()
     chunker = Chunker()
     mapper = QdrantMapper()
-    repair = HybridPageRepair()
 
     ocr: OCRPipeline | None = None
     docling_ready = False
+    docling_targets: set[int] = set()
+    decision_rows: list[dict[str, Any]] = []
 
     doc_id = _stable_doc_id(pdf_path)
     selected_pages = sorted({int(page) for page in args.pages})
@@ -230,16 +249,6 @@ def main() -> int:
     scanned_pages: set[int] = set()
 
     with fitz.open(pdf_path) as doc:
-        if docling.available:
-            try:
-                priming_started = time.perf_counter()
-                docling.prime_document(pdf_path, page_numbers=selected_pages)
-                docling_ready = True
-                _log_stage(f"docling prime {pdf_path.name}", priming_started)
-            except Exception as exc:
-                docling.clear_document(pdf_path)
-                print(f"[DOCLING] prime failed for {pdf_path.name}; falling back to native parser on digitized pages: {exc}")
-
         for page_number in selected_pages:
             if page_number < 1 or page_number > doc.page_count:
                 raise ValueError(f"page {page_number} out of range 1..{doc.page_count}")
@@ -259,139 +268,182 @@ def main() -> int:
             )
             _log_stage(f"classify page {page_number}", classify_started)
 
-            ocr_result: dict[str, Any] | None = None
-            docling_result: dict[str, Any] | None = None
-            repair_result = None
+            native_text = "\n".join(
+                str(unit.get("text") or "").strip() for unit in native_page.text_units if str(unit.get("text") or "").strip()
+            )
+            use_ocr, ocr_reason = classifier.should_use_ocr(native_text, parser)
 
-            if classification.page_type == "digitized":
-                selected_units = native_page.text_units
-                structure_engine = "pymupdf"
-                page_quality_updates: dict[str, Any] = {}
+            route = "native"
+            route_reason = "native_clean"
+            if not native_text.strip():
+                route = "ocr"
+                route_reason = "empty_native"
+            elif use_ocr:
+                route = "ocr"
+                route_reason = ocr_reason
+            elif classification.page_type != "digitized":
+                route = "ocr"
+                route_reason = classification.reason
+            else:
+                use_docling, docling_reason = classifier.should_use_docling(native_page.text_units)
+                if use_docling:
+                    route = "docling"
+                    route_reason = docling_reason
+                    docling_targets.add(page_number)
 
-                if repair.should_use_hybrid_repair(native_page.text_units, parser):
-                    if ocr is None:
-                        ocr = OCRPipeline()
-                    ocr_profile = repair.select_ocr_profile(native_page.text_units, parser)
-                    ocr_started = time.perf_counter()
-                    ocr_result = ocr.process_page(
+            if route == "ocr":
+                scanned_pages.add(page_number)
+
+            print(f"[ROUTER] page {page_number}: route={route} reason={route_reason}")
+            decision_rows.append(
+                {
+                    "page_number": page_number,
+                    "native_page": native_page,
+                    "classification": classification,
+                    "route": route,
+                    "route_reason": route_reason,
+                }
+            )
+
+        if docling.available and docling_targets:
+            try:
+                priming_started = time.perf_counter()
+                docling.prime_document(pdf_path, page_numbers=sorted(docling_targets))
+                docling_ready = True
+                _log_stage(f"docling prime selective {pdf_path.name}", priming_started)
+            except Exception as exc:
+                docling.clear_document(pdf_path)
+                docling_ready = False
+                print(f"[DOCLING] selective prime failed for {pdf_path.name}; falling back to native parser: {exc}")
+
+    for decision in decision_rows:
+        page_number = int(decision["page_number"])
+        native_page = decision["native_page"]
+        classification = decision["classification"]
+        route = str(decision["route"])
+        route_reason = str(decision["route_reason"])
+
+        ocr_result: dict[str, Any] | None = None
+        docling_result: dict[str, Any] | None = None
+
+        if route == "ocr":
+            if ocr is None:
+                ocr = OCRPipeline()
+            ocr_started = time.perf_counter()
+            ocr_result = ocr.process_page(
+                pdf_path=pdf_path,
+                page_number=page_number,
+                route_reason=classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback",
+                ocr_profile="default",
+            )
+            _log_stage(f"ocr page {page_number}", ocr_started)
+            raw_line_units = list(ocr_result.get("line_units") or [])
+            if raw_line_units:
+                merged_line_units = OCRPipeline.merge_line_units(raw_line_units)
+                ocr_units = merged_line_units or raw_line_units
+                effective_granularity = "line_merged" if len(ocr_units) < len(raw_line_units) else "line"
+            else:
+                ocr_units = list(ocr_result.get("text_units") or [])
+                effective_granularity = "paragraph"
+            if not ocr_units and native_page.text_units:
+                raise RuntimeError(f"OCR failed on page {page_number}")
+
+            ocr_route = classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback"
+            page_model = builder.build(
+                doc_id=doc_id,
+                source_file=pdf_path.name,
+                page_number=page_number,
+                route=ocr_route,
+                ocr_units=ocr_units,
+                ocr_confidence=ocr_result.get("confidence"),
+            )
+            quality = page_model.setdefault("quality", {})
+            quality["structure_engine"] = "vision"
+            quality["route_reason"] = route_reason
+            quality["ocr_unit_granularity"] = effective_granularity
+            quality["ocr_line_unit_count_raw"] = len(raw_line_units)
+            quality["ocr_unit_count_effective"] = len(ocr_units)
+            docling_result = {"used": False, "reason": "route_ocr"}
+        else:
+            selected_units = native_page.text_units
+            structure_engine = "pymupdf"
+
+            if route == "docling" and docling_ready:
+                try:
+                    docling_started = time.perf_counter()
+                    docling_page = docling.parse_page(
                         pdf_path=pdf_path,
-                        page_number=page_number,
-                        route_reason="garbled",
-                        ocr_profile=ocr_profile,
-                    )
-                    _log_stage(f"ocr hybrid page {page_number}", ocr_started)
-                    repair_result = repair.repair_units(
-                        native_units=native_page.text_units,
-                        ocr_result=ocr_result,
-                        parser=parser,
                         page_number=page_number,
                         source_file=pdf_path.name,
                     )
-                    selected_units = repair_result.text_units
-                    structure_engine = "hybrid_native_vision" if repair_result.used_ocr else "hybrid_native_legacy"
-                    page_quality_updates = {
-                        "hybrid_repair": True,
-                        "hybrid_repair_used_ocr": repair_result.used_ocr,
-                        "hybrid_repair_legacy_units": len(repair_result.legacy_repaired_unit_indexes),
-                        "hybrid_repair_ocr_units": len(repair_result.repaired_unit_indexes),
-                        "ocr_confidence": ocr_result.get("confidence") if repair_result.used_ocr else None,
-                        "repair_mode": "mixed_native_repair",
-                    }
+                    _log_stage(f"docling page {page_number}", docling_started)
+                    if docling_page.text_units:
+                        selected_units = docling_page.text_units
+                        structure_engine = "docling"
                     docling_result = {
-                        "used": False,
-                        "reason": "hybrid_repair",
-                        "used_ocr": repair_result.used_ocr,
-                        "ocr_profile": ocr_profile,
+                        "used": structure_engine == "docling",
+                        "table_count": int(docling_page.table_count),
+                        "text_unit_count": len(docling_page.text_units),
                     }
-                elif docling_ready:
-                    try:
-                        docling_started = time.perf_counter()
-                        docling_page = docling.parse_page(
-                            pdf_path=pdf_path,
-                            page_number=page_number,
-                            source_file=pdf_path.name,
-                        )
-                        _log_stage(f"docling page {page_number}", docling_started)
-                        if docling_page.text_units:
-                            selected_units = docling_page.text_units
-                            structure_engine = "docling"
-                        docling_result = {
-                            "used": structure_engine == "docling",
-                            "table_count": int(docling_page.table_count),
-                            "text_unit_count": len(docling_page.text_units),
-                        }
-                    except Exception as exc:
-                        docling_result = {"used": False, "error": str(exc)}
-                else:
-                    docling_result = {"used": False, "error": "docling_not_primed" if docling.available else "docling_unavailable"}
-
-                page_model = builder.build(
-                    doc_id=doc_id,
-                    source_file=pdf_path.name,
-                    page_number=page_number,
-                    route="digitized",
-                    native_units=selected_units,
-                )
-                quality = page_model.setdefault("quality", {})
-                quality["structure_engine"] = structure_engine
-                quality.update(page_quality_updates)
-
+                except Exception as exc:
+                    docling_result = {"used": False, "error": str(exc)}
+            elif route == "docling":
+                docling_result = {"used": False, "error": "docling_not_primed"}
             else:
-                scanned_pages.add(page_number)
-                if ocr is None:
-                    ocr = OCRPipeline()
-                ocr_profile = repair.select_ocr_profile(native_page.text_units, parser)
-                ocr_started = time.perf_counter()
-                ocr_result = ocr.process_page(
-                    pdf_path=pdf_path,
-                    page_number=page_number,
-                    route_reason=classification.page_type,
-                    ocr_profile=ocr_profile,
-                )
-                _log_stage(f"ocr page {page_number}", ocr_started)
-                if not ocr_result.get("text_units") and native_page.text_units:
-                    raise RuntimeError(f"OCR failed on page {page_number}")
-                page_model = builder.build(
-                    doc_id=doc_id,
-                    source_file=pdf_path.name,
-                    page_number=page_number,
-                    route=classification.page_type,
-                    ocr_units=ocr_result.get("text_units") or [],
-                    ocr_confidence=ocr_result.get("confidence"),
-                )
+                docling_result = {"used": False, "reason": "native_selected"}
 
-            page_model = layout.apply(page_model)
-            page_model = shloka.apply(page_model)
-
-            page_artifacts.append(
-                {
-                    "page_number": page_number,
-                    "classification": {
-                        "page_type": classification.page_type,
-                        "reason": classification.reason,
-                        "native_text_ok": classification.native_text_ok,
-                        "image_heavy": classification.image_heavy,
-                    },
-                    "native_parse": {
-                        "raw_text": native_page.raw_text,
-                        "text_units": native_page.text_units,
-                    },
-                    "docling_result": docling_result,
-                    "repair_result": asdict(repair_result) if repair_result is not None else None,
-                    "ocr_result": {
-                        "engine_used": (ocr_result or {}).get("engine_used"),
-                        "confidence": (ocr_result or {}).get("confidence"),
-                        "text": (ocr_result or {}).get("text"),
-                        "text_units": (ocr_result or {}).get("text_units") or [],
-                        "word_units": (ocr_result or {}).get("word_units") or [],
-                    } if ocr_result is not None else None,
-                    "page_model_pre_noise": page_model,
-                }
+            page_model = builder.build(
+                doc_id=doc_id,
+                source_file=pdf_path.name,
+                page_number=page_number,
+                route="digitized",
+                native_units=selected_units,
             )
-            page_models.append(page_model)
+            quality = page_model.setdefault("quality", {})
+            quality["structure_engine"] = structure_engine
+            quality["route_reason"] = route_reason
 
-            del native_page
-            gc.collect()
+        page_model = layout.apply(page_model)
+        page_model = shloka.apply(page_model)
+
+        page_artifacts.append(
+            {
+                "page_number": page_number,
+                "router_decision": {
+                    "route": route,
+                    "reason": route_reason,
+                },
+                "classification": {
+                    "page_type": classification.page_type,
+                    "reason": classification.reason,
+                    "native_text_ok": classification.native_text_ok,
+                    "image_heavy": classification.image_heavy,
+                },
+                "native_parse": {
+                    "raw_text": native_page.raw_text,
+                    "text_units": native_page.text_units,
+                },
+                "docling_result": docling_result,
+                "repair_result": None,
+                "ocr_result": {
+                    "engine_used": (ocr_result or {}).get("engine_used"),
+                    "confidence": (ocr_result or {}).get("confidence"),
+                    "text": (ocr_result or {}).get("text"),
+                    "text_units": (ocr_result or {}).get("text_units") or [],
+                    "line_units": (ocr_result or {}).get("line_units") or [],
+                    "effective_units": ocr_units,
+                    "effective_unit_granularity": quality.get("ocr_unit_granularity"),
+                    "word_units": (ocr_result or {}).get("word_units") or [],
+                }
+                if ocr_result is not None
+                else None,
+                "page_model_pre_noise": page_model,
+            }
+        )
+        page_models.append(page_model)
+
+        del native_page
+        gc.collect()
 
     if docling.available:
         docling.clear_document(pdf_path)
@@ -414,6 +466,7 @@ def main() -> int:
         linker.apply(page_model, image_rows)
 
     chunks = chunker.chunk_document(page_models)
+    avg_chunks_per_page, chunk_fragmentation_flag = _chunk_fragmentation_stats(chunks, page_models)
 
     for page_model in page_models:
         for image in page_model.get("images", []):
@@ -458,6 +511,12 @@ def main() -> int:
         "doc_id": doc_id,
         "source_file": pdf_path.name,
         "pages": selected_pages,
+        "chunk_stats": {
+            "chunk_count": len(chunks),
+            "page_count": len(page_models),
+            "avg_chunks_per_page": round(avg_chunks_per_page, 2),
+            "fragmentation_flag": chunk_fragmentation_flag,
+        },
         "page_stage_outputs": output_stage,
         "page_models_final": output_models,
         "image_rows": image_rows,
@@ -476,6 +535,12 @@ def main() -> int:
     print(f"image_output_dir={image_output_dir}")
     print(f"pages={selected_pages}")
     print(f"chunks={len(chunks)}")
+    print(f"avg_chunks_per_page={avg_chunks_per_page:.2f}")
+    if chunk_fragmentation_flag is not None:
+        print(
+            f"[CHUNKING][WARN] fragmentation={chunk_fragmentation_flag} "
+            f"(avg_chunks_per_page={avg_chunks_per_page:.2f}; expected < 30)"
+        )
     print(f"images={len(image_rows)}")
     print("Inspect `page_stage_outputs`, `page_models_final`, `chunks`, and optional `qdrant_*_points` in the JSON.")
     return 0

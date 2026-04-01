@@ -164,6 +164,16 @@ def _flatten_page_blocks(page_models: list[dict[str, Any]]) -> list[dict[str, An
     return rows
 
 
+def _chunk_fragmentation_stats(chunks: list[dict[str, Any]], page_models: list[dict[str, Any]]) -> tuple[float, str | None]:
+    page_count = max(1, len(page_models))
+    avg_chunks_per_page = float(len(chunks)) / float(page_count)
+    if avg_chunks_per_page >= 40.0:
+        return avg_chunks_per_page, "critical_fragmentation"
+    if avg_chunks_per_page >= 30.0:
+        return avg_chunks_per_page, "high_fragmentation"
+    return avg_chunks_per_page, None
+
+
 def _collect_page_models(pdf_path: Path, doc_id: str, run_state: RunState) -> tuple[list[dict[str, Any]], set[int]]:
     parser = NativePDFParser()
     docling = DoclingPDFParser()
@@ -264,7 +274,13 @@ def _collect_page_models(pdf_path: Path, doc_id: str, run_state: RunState) -> tu
                         ocr_profile="default",
                     )
                     _log_stage(f"ocr page {page_number}", ocr_started)
-                    if not ocr_result.get("text_units") and native_page.text_units:
+                    raw_line_units = list(ocr_result.get("line_units") or [])
+                    if raw_line_units:
+                        merged_line_units = OCRPipeline.merge_line_units(raw_line_units)
+                        ocr_units = merged_line_units or raw_line_units
+                    else:
+                        ocr_units = list(ocr_result.get("text_units") or [])
+                    if not ocr_units and native_page.text_units:
                         raise RuntimeError(f"OCR failed on page {page_number}")
 
                     ocr_route = classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback"
@@ -273,12 +289,18 @@ def _collect_page_models(pdf_path: Path, doc_id: str, run_state: RunState) -> tu
                         source_file=pdf_path.name,
                         page_number=page_number,
                         route=ocr_route,
-                        ocr_units=ocr_result.get("text_units") or [],
+                        ocr_units=ocr_units,
                         ocr_confidence=ocr_result.get("confidence"),
                     )
                     quality = page_model.setdefault("quality", {})
                     quality["structure_engine"] = "vision"
                     quality["route_reason"] = route_reason
+                    if raw_line_units:
+                        quality["ocr_unit_granularity"] = "line_merged" if len(ocr_units) < len(raw_line_units) else "line"
+                    else:
+                        quality["ocr_unit_granularity"] = "paragraph"
+                    quality["ocr_line_unit_count_raw"] = len(raw_line_units)
+                    quality["ocr_unit_count_effective"] = len(ocr_units)
                 else:
                     selected_units = native_page.text_units
                     structure_engine = "pymupdf"
@@ -438,6 +460,13 @@ def ingest_pdf(
         )
 
         chunks = Chunker().chunk_document(page_models)
+        avg_chunks_per_page, chunk_fragmentation_flag = _chunk_fragmentation_stats(chunks, page_models)
+        _log(f"[CHUNKING] pages={len(page_models)} chunks={len(chunks)} avg_chunks_per_page={avg_chunks_per_page:.2f}")
+        if chunk_fragmentation_flag is not None:
+            _log(
+                f"[CHUNKING][WARN] fragmentation={chunk_fragmentation_flag} "
+                f"(avg_chunks_per_page={avg_chunks_per_page:.2f}; expected < 30)"
+            )
         images = _upload_images(page_models=page_models, uploader=cloudinary_uploader, run_state=run_state)
 
         for image in images:
@@ -475,6 +504,8 @@ def ingest_pdf(
         "source_file": pdf_path.name,
         "page_count": len(page_models),
         "chunks_stored": len(text_points),
+        "avg_chunks_per_page": round(avg_chunks_per_page, 2),
+        "chunk_fragmentation_flag": chunk_fragmentation_flag,
         "images_stored": len(image_points),
         "failed_pages": state.get("failed_pages", {}),
     }
@@ -537,7 +568,9 @@ def main() -> int:
     for summary in summaries:
         print(
             f"doc_id={summary['doc_id']} source={summary['source_file']} "
-            f"pages={summary['page_count']} chunks={summary['chunks_stored']} images={summary['images_stored']}"
+            f"pages={summary['page_count']} chunks={summary['chunks_stored']} "
+            f"avg_chunks_per_page={summary.get('avg_chunks_per_page')} "
+            f"images={summary['images_stored']} fragmentation={summary.get('chunk_fragmentation_flag')}"
         )
     return 0
 

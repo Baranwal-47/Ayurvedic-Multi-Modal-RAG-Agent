@@ -72,6 +72,9 @@ class PageClassifier:
         if not text:
             return True, "empty_native"
 
+        if self._looks_like_index_page(text):
+            return False, "index_like_native"
+
         if parser.is_text_garbled(text):
             return True, "parser_garbled"
 
@@ -82,6 +85,8 @@ class PageClassifier:
             reasons.append("too_short")
         if quality["mojibake_ratio"] > self.max_mojibake_ratio:
             reasons.append("mojibake_like")
+        if quality["legacy_mixed_ratio"] > 0.10:
+            reasons.append("legacy_mixed_tokens")
         if quality["non_ascii_ratio"] > self.max_non_ascii_ratio and quality["indic_ratio"] < 0.10:
             reasons.append("high_non_ascii_ratio")
         if quality["meaningful_ratio"] < self.min_meaningful_word_ratio:
@@ -126,6 +131,7 @@ class PageClassifier:
         indic_chars = sum(1 for ch in compact if self._is_indic_char(ch))
         mojibake_markers = len(re.findall(r"(?:Ã.|Â.|ï.|à¤|à¥|à¦|à¨|àª|à³)", compact))
         meaningful_words = sum(1 for word in words if self._is_meaningful_token(word))
+        legacy_mixed_tokens = sum(1 for word in words if self._looks_like_legacy_mixed_token(word))
         symbol_regex_hit = any(self._is_weird_symbol(ch) for ch in compact)
 
         return {
@@ -133,10 +139,26 @@ class PageClassifier:
             "non_ascii_ratio": non_ascii_chars / total_chars,
             "indic_ratio": indic_chars / total_chars,
             "mojibake_ratio": mojibake_markers / total_chars,
+            "legacy_mixed_ratio": legacy_mixed_tokens / total_words,
             "meaningful_ratio": meaningful_words / total_words,
             "symbol_regex_hit": symbol_regex_hit,
             "too_short": len(compact) < self.min_native_chars,
         }
+
+    def _looks_like_legacy_mixed_token(self, token: str) -> bool:
+        raw = str(token or "").strip()
+        if not raw:
+            return False
+
+        has_ascii = any("a" <= ch.lower() <= "z" for ch in raw)
+        has_non_ascii = any(ord(ch) > 127 for ch in raw)
+        has_indic = any(self._is_indic_char(ch) for ch in raw)
+
+        if not (has_ascii and has_non_ascii):
+            return False
+        if has_indic:
+            return False
+        return True
 
     @staticmethod
     def _has_table_anchor(text: str) -> bool:

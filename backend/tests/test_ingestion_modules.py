@@ -15,6 +15,7 @@ from ingestion.hybrid_page_repair import HybridPageRepair
 from ingestion.docling_parser import plan_page_windows
 from ingestion.native_pdf_parser import NativePDFParser
 from ingestion.noise_detector import NoiseDetector
+from ingestion.ocr_pipeline import OCRPipeline
 from ingestion.page_classifier import PageClassifier
 from ingestion.page_layout import PageLayout
 from ingestion.page_model_builder import PageModelBuilder
@@ -792,3 +793,66 @@ def test_page_model_builder_preserves_table_cells() -> None:
 
 def test_plan_page_windows_groups_contiguous_ranges() -> None:
     assert plan_page_windows([1, 2, 3, 6, 7, 10], batch_size=2) == [(1, 2), (3, 3), (6, 7), (10, 10)]
+
+
+def test_ocr_line_merger_merges_short_lines() -> None:
+    line_units = [
+        {
+            "unit_id": "doc:p1:ocr-line:1",
+            "text": "Indo - Romanic Equivalents",
+            "bbox": [100.0, 100.0, 420.0, 116.0],
+            "reading_order": 0,
+            "page_number": 1,
+            "source_file": "sample.pdf",
+            "source_engine": "vision",
+            "languages": ["unknown"],
+            "scripts": ["Zyyy"],
+            "confidence": 0.90,
+        },
+        {
+            "unit_id": "doc:p1:ocr-line:2",
+            "text": "of Devanagari Alphabets",
+            "bbox": [102.0, 118.0, 418.0, 134.0],
+            "reading_order": 1,
+            "page_number": 1,
+            "source_file": "sample.pdf",
+            "source_engine": "vision",
+            "languages": ["unknown"],
+            "scripts": ["Zyyy"],
+            "confidence": 0.92,
+        },
+    ]
+
+    merged = OCRPipeline.merge_line_units(line_units)
+
+    assert len(merged) == 1
+    assert "Indo - Romanic Equivalents" in merged[0]["text"]
+    assert "of Devanagari Alphabets" in merged[0]["text"]
+    assert merged[0]["merged_line_count"] == 2
+
+
+def test_ocr_line_merger_does_not_merge_large_vertical_gaps() -> None:
+    line_units = [
+        {
+            "unit_id": "doc:p1:ocr-line:1",
+            "text": "Short heading",
+            "bbox": [80.0, 80.0, 260.0, 96.0],
+            "reading_order": 0,
+            "page_number": 1,
+            "source_file": "sample.pdf",
+            "source_engine": "vision",
+        },
+        {
+            "unit_id": "doc:p1:ocr-line:2",
+            "text": "A long paragraph line that starts after a clear section break.",
+            "bbox": [82.0, 180.0, 520.0, 198.0],
+            "reading_order": 1,
+            "page_number": 1,
+            "source_file": "sample.pdf",
+            "source_engine": "vision",
+        },
+    ]
+
+    merged = OCRPipeline.merge_line_units(line_units)
+
+    assert len(merged) == 2
