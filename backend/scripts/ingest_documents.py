@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import gc
 import hashlib
+import re
 import os
 import sys
 import time
@@ -86,7 +87,7 @@ def _document_log_path(run_state: RunState, doc_id: str) -> Path:
 
 def _cleanup_document_artifacts(*, doc_id: str, pdf_path: Path, qdrant: QdrantManager, cloudinary_uploader: CloudinaryUploader) -> None:
     qdrant.delete_by_doc_id(doc_id)
-    cloudinary_uploader.delete_document_assets(pdf_path.name)
+    cloudinary_uploader.delete_document_assets(doc_id, pdf_path.name)
 
 
 def _run_with_retries(*, label: str, fn, retries: int, wait_sec: float):
@@ -172,6 +173,53 @@ def _chunk_fragmentation_stats(chunks: list[dict[str, Any]], page_models: list[d
     if avg_chunks_per_page >= 30.0:
         return avg_chunks_per_page, "high_fragmentation"
     return avg_chunks_per_page, None
+
+
+def _safe_path_component(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", str(value or "")).strip().strip(" .")
+    return cleaned or "untitled"
+
+
+def _env_int(*names: str, default: int) -> int:
+    for name in names:
+        raw_value = os.getenv(name)
+        if raw_value is None or not str(raw_value).strip():
+            continue
+        try:
+            return int(str(raw_value).strip())
+        except ValueError:
+            _log(f"[ENV] ignoring invalid integer for {name}: {raw_value!r}")
+    return int(default)
+
+
+def _upsert_points_in_batches(
+    *,
+    points: list[dict[str, Any]],
+    upsert_fn,
+    label: str,
+    batch_size: int,
+    retries: int,
+    wait_sec: float,
+) -> None:
+    if not points:
+        return
+
+    safe_batch_size = max(1, int(batch_size))
+    total = len(points)
+    total_batches = (total + safe_batch_size - 1) // safe_batch_size
+
+    for batch_index, start in enumerate(range(0, total, safe_batch_size), start=1):
+        batch = points[start : start + safe_batch_size]
+        _log(
+            f"[QDRANT] {label} batch {batch_index}/{total_batches} "
+            f"size={len(batch)}"
+        )
+        _run_with_retries(
+            label=f"{label} batch {batch_index}/{total_batches}",
+            fn=lambda current_batch=batch: upsert_fn(current_batch),
+            retries=retries,
+            wait_sec=wait_sec,
+        )
 
 
 def _collect_page_models(pdf_path: Path, doc_id: str, run_state: RunState) -> tuple[list[dict[str, Any]], set[int]]:
@@ -386,6 +434,7 @@ def _upload_images(
             if not local_path:
                 continue
             public_id = uploader.build_public_id(
+                doc_id=page_model["doc_id"],
                 source_file=page_model["source_file"],
                 page_number=page_model["page_number"],
                 figure_index=int(image.get("figure_index") or 1),
@@ -447,7 +496,7 @@ def ingest_pdf(
 
     run_state.start_document(doc_id)
 
-    image_output_dir = image_output_root / pdf_path.stem
+    image_output_dir = image_output_root / doc_id
     image_output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -480,11 +529,35 @@ def ingest_pdf(
         text_points = mapper.map_text_points(chunks, text_vectors)
         image_points = mapper.map_image_points(images, image_vectors)
 
-        _run_with_retries(
-            label=f"qdrant upsert for {pdf_path.name}",
-            fn=lambda: (qdrant.upsert_text_chunks(text_points), qdrant.upsert_image_chunks(image_points)),
-            retries=int(os.getenv("QDRANT_UPSERT_RETRIES", "3")),
-            wait_sec=float(os.getenv("QDRANT_UPSERT_RETRY_WAIT_SEC", "2")),
+        upsert_retries = _env_int("QDRANT_UPSERT_RETRIES", default=3)
+        upsert_wait_sec = float(os.getenv("QDRANT_UPSERT_RETRY_WAIT_SEC", "2"))
+        default_batch_size = _env_int("QDRANT_UPSERT_BATCH_SIZE", "QDRANT_UPSERT_BATCH", default=128)
+        text_batch_size = _env_int(
+            "QDRANT_TEXT_UPSERT_BATCH_SIZE",
+            "QDRANT_TEXT_UPSERT_BATCH",
+            default=default_batch_size,
+        )
+        image_batch_size = _env_int(
+            "QDRANT_IMAGE_UPSERT_BATCH_SIZE",
+            "QDRANT_IMAGE_UPSERT_BATCH",
+            default=default_batch_size,
+        )
+
+        _upsert_points_in_batches(
+            points=text_points,
+            upsert_fn=qdrant.upsert_text_chunks,
+            label=f"qdrant text upsert for {pdf_path.name}",
+            batch_size=text_batch_size,
+            retries=upsert_retries,
+            wait_sec=upsert_wait_sec,
+        )
+        _upsert_points_in_batches(
+            points=image_points,
+            upsert_fn=qdrant.upsert_image_chunks,
+            label=f"qdrant image upsert for {pdf_path.name}",
+            batch_size=image_batch_size,
+            retries=upsert_retries,
+            wait_sec=upsert_wait_sec,
         )
     except Exception:
         qdrant.delete_by_doc_id(doc_id)

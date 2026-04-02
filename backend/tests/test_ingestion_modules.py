@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ingestion.chunker import Chunker
+from ingestion.cloudinary_uploader import CloudinaryUploader
 from ingestion.image_extractor import ImageExtractor
 from ingestion.hybrid_page_repair import HybridPageRepair
 from ingestion.docling_parser import plan_page_windows
@@ -622,6 +623,25 @@ def test_image_extractor_keeps_table_like_candidate_on_scanned_page() -> None:
     )
 
     assert keep is True
+
+
+def test_image_extractor_sanitizes_path_components() -> None:
+    assert ImageExtractor._safe_path_component("Appendix_Volume I ") == "Appendix_Volume I"
+    assert ImageExtractor._safe_path_component("bad:name/with*chars") == "bad_name_with_chars"
+
+
+def test_cloudinary_uploader_uses_doc_id_for_public_ids() -> None:
+    uploader = CloudinaryUploader(
+        cloud_name="test",
+        api_key="test",
+        api_secret="test",
+    )
+
+    public_id_a = uploader.build_public_id("doc-a", "same-name.pdf", 3, 1)
+    public_id_b = uploader.build_public_id("doc-b", "same-name.pdf", 3, 1)
+
+    assert public_id_a != public_id_b
+    assert uploader.build_document_prefix("doc-a", "same-name.pdf") != uploader.build_document_prefix("doc-b", "same-name.pdf")
 
 
 def test_hybrid_page_repair_replaces_only_suspect_units() -> None:

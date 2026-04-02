@@ -69,17 +69,23 @@ class CloudinaryUploader:
             read_timeout_sec=int(os.getenv("CLOUDINARY_READ_TIMEOUT_SEC", "300")),
         )
 
-    def build_public_id(self, source_file: str, page_number: int, figure_index: int) -> str:
-        source_stem = Path(str(source_file or "")).stem
-        safe_stem = self._slug(source_stem) or "unknown_source"
+    def build_public_id(self, doc_id: str | None, source_file: str, page_number: int, figure_index: int) -> str:
+        safe_doc = self._slug(str(doc_id or "")) if doc_id else ""
+        if not safe_doc:
+            source_stem = Path(str(source_file or "")).stem
+            safe_doc = self._slug(source_stem) or "unknown_source"
         page = max(1, int(page_number or 1))
         figure = max(1, int(figure_index or 1))
-        return f"{self.upload_folder}/{safe_stem}/page_{page}/figure_{figure}"
+        return f"{self.upload_folder}/{safe_doc}/page_{page}/figure_{figure}"
 
-    def build_document_prefix(self, source_file: str) -> str:
-        source_stem = Path(str(source_file or "")).stem
-        safe_stem = self._slug(source_stem) or "unknown_source"
-        return f"{self.upload_folder}/{safe_stem}"
+    def build_document_prefix(self, doc_id: str | None, source_file: str | None = None) -> str:
+        safe_doc = self._slug(str(doc_id or "")) if doc_id else ""
+        if not safe_doc and source_file is not None:
+            source_stem = Path(str(source_file or "")).stem
+            safe_doc = self._slug(source_stem) or "unknown_source"
+        if not safe_doc:
+            safe_doc = "unknown_source"
+        return f"{self.upload_folder}/{safe_doc}"
 
     def upload_image(self, file_path: str | Path, public_id: str) -> tuple[str, str]:
         path = Path(file_path)
@@ -145,8 +151,8 @@ class CloudinaryUploader:
             raise
         return result if isinstance(result, dict) else None
 
-    def delete_document_assets(self, source_file: str) -> dict[str, Any] | None:
-        prefix = self.build_document_prefix(source_file)
+    def delete_document_assets(self, doc_id: str | None, source_file: str | None = None) -> dict[str, Any] | None:
+        prefix = self.build_document_prefix(doc_id, source_file)
         try:
             result = self._retry_call(
                 operation_label=f"delete prefix={prefix}",

@@ -17,6 +17,11 @@ class ImageExtractor:
 	SURROUNDING_TEXT_MAX_CHARS = 720
 	SURROUNDING_TEXT_MAX_BLOCKS = 6
 
+	@staticmethod
+	def _safe_path_component(value: str) -> str:
+		cleaned = re.sub(r'[<>:"/\\|?*]+', "_", str(value or "")).strip().strip(" .")
+		return cleaned or "untitled"
+
 	def extract(
 		self,
 		pdf_path: str | Path,
@@ -36,7 +41,7 @@ class ImageExtractor:
 		out_dir = Path(output_dir)
 		out_dir.mkdir(parents=True, exist_ok=True)
 
-		source_stem = path.stem
+		source_stem = self._safe_path_component(path.stem)
 		source_file = path.name
 		rows: list[dict[str, Any]] = []
 		scanned_page_set = set(scanned_pages or set())

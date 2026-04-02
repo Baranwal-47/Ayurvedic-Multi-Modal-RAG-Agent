@@ -13,6 +13,7 @@ import copy
 import gc
 import hashlib
 import json
+import re
 import time
 import sys
 from pathlib import Path
@@ -214,16 +215,16 @@ def _chunk_fragmentation_stats(chunks: list[dict[str, Any]], page_models: list[d
     return avg_chunks_per_page, None
 
 
+def _safe_path_component(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", str(value or "")).strip().strip(" .")
+    return cleaned or "untitled"
+
+
 def main() -> int:
     args = _parse_args()
     pdf_path = args.pdf
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-    output_dir = args.output_dir / pdf_path.stem
-    output_dir.mkdir(parents=True, exist_ok=True)
-    image_output_dir = output_dir / "images"
-    image_output_dir.mkdir(parents=True, exist_ok=True)
 
     parser = NativePDFParser()
     docling = DoclingPDFParser()
@@ -243,6 +244,10 @@ def main() -> int:
     decision_rows: list[dict[str, Any]] = []
 
     doc_id = _stable_doc_id(pdf_path)
+    output_dir = args.output_dir / doc_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_output_dir = output_dir / "images"
+    image_output_dir.mkdir(parents=True, exist_ok=True)
     selected_pages = sorted({int(page) for page in args.pages})
     page_artifacts: list[dict[str, Any]] = []
     page_models: list[dict[str, Any]] = []
@@ -525,7 +530,7 @@ def main() -> int:
         "qdrant_image_points": image_points,
     }
 
-    output_json = output_dir / f"{pdf_path.stem}_pages_{'_'.join(str(page) for page in selected_pages)}.json"
+    output_json = output_dir / f"{_safe_path_component(pdf_path.stem)}_pages_{'_'.join(str(page) for page in selected_pages)}.json"
     output_json.write_text(
         json.dumps(final_payload, ensure_ascii=False, indent=2, default=_json_default),
         encoding="utf-8",
