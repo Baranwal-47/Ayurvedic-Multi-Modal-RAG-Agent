@@ -83,7 +83,7 @@ class GroqLLMClient(LLMClient):
         completion = self._client_instance().chat.completions.create(
             model=self._model_name,
             temperature=0.2,
-            max_completion_tokens=900,
+            max_completion_tokens=600,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -98,7 +98,7 @@ class GroqLLMClient(LLMClient):
         stream = self._client_instance().chat.completions.create(
             model=self._model_name,
             temperature=0.2,
-            max_completion_tokens=900,
+            max_completion_tokens=600,
             stream=True,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -140,7 +140,7 @@ class QueryEngine:
         self.llm_client = llm_client or self._default_llm_client()
 
     def prewarm(self, *, load_reranker: bool = True) -> None:
-        self.text_embedder.embed(["warmup"])
+        self.searcher.prewarm()
         if load_reranker:
             self.reranker.prewarm()
 
@@ -223,6 +223,7 @@ class QueryEngine:
         source_file: str | None = None,
         include_debug: bool = False,
     ) -> Iterator[dict[str, Any]]:
+        yield {"event": "status", "data": {"stage": "retrieval", "message": "Searching the indexed corpus..."}} 
         prepared = self._prepare_query(
             query=query,
             doc_id=doc_id,
@@ -243,6 +244,7 @@ class QueryEngine:
 
         answer_parts: list[str] = []
         llm_started = time.perf_counter()
+        yield {"event": "status", "data": {"stage": "generation", "message": "Generating grounded answer..."}} 
         for token in self.llm_client.stream_generate(
             system_prompt=prepared.context_pack.system_prompt,
             user_prompt=prepared.context_pack.user_prompt,
@@ -322,11 +324,14 @@ class QueryEngine:
         return answer
 
     def _build_response(self, prepared: QueryPreparation, *, answer: str, include_debug: bool) -> dict[str, Any]:
+        citations = prepared.context_pack.citations if prepared.context_pack.enough_evidence else []
+        images = prepared.context_pack.images if prepared.context_pack.enough_evidence else []
+        tables = prepared.context_pack.tables if prepared.context_pack.enough_evidence else []
         response = {
             "answer": answer,
-            "citations": prepared.context_pack.citations,
-            "images": prepared.context_pack.images,
-            "tables": prepared.context_pack.tables,
+            "citations": citations,
+            "images": images,
+            "tables": tables,
             "enough_evidence": prepared.context_pack.enough_evidence,
             "query_intent": prepared.query_bundle.intent,
             "model": self.llm_client.model_name if self.llm_client.available() else "none",
@@ -335,9 +340,18 @@ class QueryEngine:
         if include_debug:
             response["debug"] = {
                 "query_bundle": asdict(prepared.query_bundle),
+                "retrieved_candidates": [self._serialize_candidate(candidate) for candidate in prepared.retrieval_result.candidates],
+                "reranked_candidates": [self._serialize_candidate(candidate) for candidate in prepared.evidence.reranked_candidates],
                 "retrieval": prepared.retrieval_result.debug,
                 "rerank": prepared.evidence.debug,
                 "context": prepared.context_pack.debug,
+                "final_context": {
+                    "citations": prepared.context_pack.citations,
+                    "images": prepared.context_pack.images,
+                    "tables": prepared.context_pack.tables,
+                    "enough_evidence": prepared.context_pack.enough_evidence,
+                    "user_prompt": prepared.context_pack.user_prompt,
+                },
             }
         return response
 

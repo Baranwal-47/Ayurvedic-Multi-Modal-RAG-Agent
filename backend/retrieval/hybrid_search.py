@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,6 +158,9 @@ class HybridSearcher:
         self.qdrant = qdrant
         self.text_embedder = text_embedder
         self.normalizer = normalizer or DiacriticNormalizer()
+        self._query_vector_cache: dict[str, dict[str, Any]] = {}
+        self._query_vector_cache_order: list[str] = []
+        self._query_vector_cache_size = self._env_int("QUERY_EMBED_CACHE_SIZE", default=128)
 
     def build_query_bundle(
         self,
@@ -193,7 +197,9 @@ class HybridSearcher:
                 source_file=source_file,
             ),
             include_debug=bool(include_debug),
+            text_top_k=self._env_int("TEXT_CANDIDATE_TOP_K", default=20),
             image_top_k=image_top_k,
+            rerank_top_k=self._env_int("RERANK_TOP_K", default=12),
         )
 
     def search(self, query_bundle: QueryBundle) -> HybridSearchResult:
@@ -204,17 +210,18 @@ class HybridSearcher:
             "normalized_query": query_bundle.normalized_query,
             "filters": query_bundle.filters.as_qdrant(),
         }
+        text_search_k = max(query_bundle.rerank_top_k, min(query_bundle.text_top_k, 16))
 
-        original_vector = self.text_embedder.embed([query_bundle.query])[0]
+        original_vector = self._embed_query_text(query_bundle.query)
         normalized_vector = None
         if query_bundle.normalized_query != query_bundle.query:
-            normalized_vector = self.text_embedder.embed([query_bundle.normalized_query])[0]
+            normalized_vector = self._embed_query_text(query_bundle.normalized_query)
 
         text_results_original = self.qdrant.hybrid_search_text(
             dense_vector=original_vector["dense_vector"],
             sparse_indices=original_vector["sparse_indices"],
             sparse_values=original_vector["sparse_values"],
-            top_k=24,
+            top_k=text_search_k,
             filters=query_bundle.filters.as_qdrant(),
         )
         self._merge_text_rows(candidates, text_results_original, reason="text_original")
@@ -225,7 +232,7 @@ class HybridSearcher:
                 dense_vector=normalized_vector["dense_vector"],
                 sparse_indices=normalized_vector["sparse_indices"],
                 sparse_values=normalized_vector["sparse_values"],
-                top_k=24,
+                top_k=text_search_k,
                 filters=query_bundle.filters.as_qdrant(),
             )
             self._merge_text_rows(candidates, text_results_normalized, reason="text_normalized")
@@ -253,11 +260,15 @@ class HybridSearcher:
                     "text_hits_original": len(text_results_original),
                     "text_hits_normalized": len(text_results_normalized),
                     "image_hits_direct": len(image_results),
+                    "text_search_k": text_search_k,
                     "candidate_count_merged": len(candidates),
                     "candidate_ids": [candidate.candidate_id for candidate in final_candidates],
                 }
             )
         return HybridSearchResult(query_bundle=query_bundle, candidates=final_candidates, debug=debug)
+
+    def prewarm(self) -> None:
+        self._embed_query_text("warmup")
 
     def _merge_text_rows(
         self,
@@ -461,3 +472,29 @@ class HybridSearcher:
             return True
         except Exception:
             return False
+
+    def _embed_query_text(self, text: str) -> dict[str, Any]:
+        key = str(text or "").strip()
+        cached = self._query_vector_cache.get(key)
+        if cached is not None:
+            return cached
+
+        vector = self.text_embedder.embed([key])[0]
+        self._query_vector_cache[key] = vector
+        self._query_vector_cache_order.append(key)
+
+        while len(self._query_vector_cache_order) > self._query_vector_cache_size:
+            oldest = self._query_vector_cache_order.pop(0)
+            self._query_vector_cache.pop(oldest, None)
+
+        return vector
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = str(os.getenv(name, "") or "").strip()
+        if not raw:
+            return int(default)
+        try:
+            return max(1, int(raw))
+        except Exception:
+            return int(default)

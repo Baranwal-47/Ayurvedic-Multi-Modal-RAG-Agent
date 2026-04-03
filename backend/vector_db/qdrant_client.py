@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import uuid
 from typing import Any, Iterable
+from pathlib import Path
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
@@ -26,7 +27,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", encoding="utf-8-sig")
 
 TEXT_COLLECTION = os.getenv("QDRANT_TEXT_COLLECTION", "text_chunks")
 IMAGE_COLLECTION = os.getenv("QDRANT_IMAGE_COLLECTION", "image_chunks")

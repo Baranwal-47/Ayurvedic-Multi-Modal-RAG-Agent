@@ -1,50 +1,27 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import Link from "next/link";
+import { FormEvent, startTransition, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-type Citation = {
-  id: string;
-  kind: string;
-  source_file: string;
-  page_numbers: number[];
-  section_path: string[];
-  snippet: string;
-};
-
-type ImageCard = {
-  id: string;
-  image_id: string;
-  page_number?: number | null;
-  caption: string;
-  labels: string[];
-  image_url: string;
-  source_file: string;
-};
-
-type QueryResponse = {
-  answer: string;
-  citations: Citation[];
-  images: ImageCard[];
-  tables: unknown[];
-  enough_evidence: boolean;
-  query_intent: string;
-  model: string;
-  timings: Record<string, number>;
-};
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+import { apiBaseUrl, QueryResponse, streamQuery, TableCard } from "./lib/query-api";
 
 const SAMPLE_QUERIES = [
   "What is Palika Yantra?",
+  "Explain the definition of rasa shastra",
   "Show me the figure for thin-layer chromatography",
-  "Give me the definition of rasa shastra",
 ];
 
 export default function Home() {
   const [query, setQuery] = useState(SAMPLE_QUERIES[0]);
+  const [streamedAnswer, setStreamedAnswer] = useState("");
+  const [statusMessage, setStatusMessage] = useState("Ready to search the indexed corpus.");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<QueryResponse | null>(null);
+
+  const answer = useMemo(() => streamedAnswer || result?.answer || "", [result?.answer, streamedAnswer]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -56,25 +33,41 @@ export default function Home() {
 
     setLoading(true);
     setError(null);
+    setResult(null);
+    setStreamedAnswer("");
+    setStatusMessage("Connecting to the backend...");
 
     try {
-      const response = await fetch(`${API_BASE_URL}/query`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      await streamQuery(
+        { query: trimmed },
+        {
+          onStatus: (status) => {
+            setStatusMessage(status.message);
+          },
+          onToken: (token) => {
+            setStatusMessage("Streaming answer...");
+            setStreamedAnswer((current) => current + token);
+          },
+          onFinal: (response) => {
+            startTransition(() => {
+              setResult(response);
+              setStreamedAnswer(response.answer || "");
+              setStatusMessage(
+                response.enough_evidence
+                  ? "Grounded answer ready."
+                  : "No strong evidence found in the indexed material.",
+              );
+            });
+          },
+          onError: (message) => {
+            throw new Error(message);
+          },
         },
-        body: JSON.stringify({ query: trimmed }),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(text || "Request failed");
-      }
-
-      const data = (await response.json()) as QueryResponse;
-      setResult(data);
+      );
     } catch (err) {
       setResult(null);
+      setStreamedAnswer("");
+      setStatusMessage("The request did not complete.");
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
@@ -82,40 +75,43 @@ export default function Home() {
   }
 
   return (
-    <main className="app-shell">
-      <section className="hero-panel">
-        <p className="eyebrow">Ayurveda Multimodal RAG</p>
-        <h1>Ask the backend and inspect the evidence it returns.</h1>
-        <p className="hero-copy">
-          This local frontend sends a simple <code>POST /query</code> request and renders the
-          answer, citations, and figure cards from the backend.
-        </p>
+    <main className="landing-shell">
+      <section className="landing-hero">
+        <div className="hero-topline">
+          <p className="eyebrow">Ayurvedic Multimodal RAG</p>
+          <Link href="/developer" className="ghost-link">
+            Open developer view
+          </Link>
+        </div>
 
-        <form className="query-form" onSubmit={handleSubmit}>
+        <div className="hero-copy-block">
+          <h1>Ask Ayurveda-grade questions and get grounded answers, not guesswork.</h1>
+          <p className="hero-copy">
+            The landing page stays quiet and focused: answer first, then only the images or tables
+            that actually help. The full evidence trace lives separately in the developer route.
+          </p>
+        </div>
+
+        <form className="landing-form" onSubmit={handleSubmit}>
           <label className="query-label" htmlFor="query">
-            Query
+            Ask the system
           </label>
           <textarea
             id="query"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Ask about a formulation, shloka, apparatus, figure, or procedure..."
-            rows={5}
+            placeholder="Ask about a formulation, instrument, process, figure, table, or shloka..."
+            rows={4}
           />
 
-          <div className="query-actions">
+          <div className="landing-actions">
             <button type="submit" disabled={loading}>
-              {loading ? "Querying..." : "Send /query"}
+              {loading ? "Streaming..." : "Ask"}
             </button>
 
             <div className="chips">
               {SAMPLE_QUERIES.map((sample) => (
-                <button
-                  key={sample}
-                  type="button"
-                  className="chip"
-                  onClick={() => setQuery(sample)}
-                >
+                <button key={sample} type="button" className="chip" onClick={() => setQuery(sample)}>
                   {sample}
                 </button>
               ))}
@@ -123,14 +119,14 @@ export default function Home() {
           </div>
         </form>
 
-        <div className="status-row">
-          <span>API</span>
-          <code>{API_BASE_URL}</code>
+        <div className="status-bar">
+          <span>{statusMessage}</span>
+          <code>{apiBaseUrl()}</code>
         </div>
       </section>
 
-      <section className="results-grid">
-        <article className="result-card answer-card">
+      <section className="chat-layout">
+        <article className="primary-card answer-surface">
           <div className="card-header">
             <p className="card-kicker">Answer</p>
             {result ? (
@@ -142,77 +138,93 @@ export default function Home() {
 
           {error ? <p className="error-text">{error}</p> : null}
 
-          {result ? (
-            <>
-              <p className="answer-text">{result.answer}</p>
-              <div className="meta-row">
-                <span>Intent: {result.query_intent}</span>
-                <span>Model: {result.model}</span>
-              </div>
-            </>
+          {answer ? (
+            <div className="markdown-answer">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown>
+            </div>
           ) : (
             <p className="placeholder-text">
-              Submit a query to render the answer and supporting evidence here.
+              Ask a question to start a grounded search across the indexed Ayurveda corpus.
             </p>
           )}
+
+          {result ? (
+            <div className="meta-strip">
+              <span>Intent: {result.query_intent}</span>
+              <span>Model: {result.model}</span>
+              <span>Total: {formatSeconds(totalTime(result.timings))}</span>
+            </div>
+          ) : null}
         </article>
 
-        <article className="result-card">
-          <div className="card-header">
-            <p className="card-kicker">Citations</p>
-            <span className="pill">{result?.citations.length ?? 0}</span>
-          </div>
+        <aside className="support-rail">
+          {result?.enough_evidence && result.tables.length ? (
+            <section className="primary-card media-panel">
+              <div className="card-header">
+                <p className="card-kicker">Relevant Tables</p>
+                <span className="pill">{result.tables.length}</span>
+              </div>
+              <div className="stack">
+                {result.tables.map((table) => (
+                  <TablePreview key={table.id} table={table} />
+                ))}
+              </div>
+            </section>
+          ) : null}
 
-          <div className="stack">
-            {result?.citations.length ? (
-              result.citations.map((citation) => (
-                <div key={citation.id} className="citation-item">
-                  <div className="citation-head">
-                    <strong>{citation.id}</strong>
-                    <span>
-                      {citation.source_file} · p{citation.page_numbers.join(", ")}
-                    </span>
-                  </div>
-                  {citation.section_path.length ? (
-                    <p className="section-path">{citation.section_path.join(" > ")}</p>
-                  ) : null}
-                  <p>{citation.snippet}</p>
-                </div>
-              ))
-            ) : (
-              <p className="placeholder-text">No citations yet.</p>
-            )}
-          </div>
-        </article>
-
-        <article className="result-card">
-          <div className="card-header">
-            <p className="card-kicker">Images</p>
-            <span className="pill">{result?.images.length ?? 0}</span>
-          </div>
-
-          <div className="stack">
-            {result?.images.length ? (
-              result.images.map((image) => (
-                <div key={image.id} className="image-card">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={image.image_url} alt={image.caption || image.image_id} />
-                  <div className="image-meta">
-                    <strong>{image.id}</strong>
-                    <p>{image.caption || "No caption available."}</p>
-                    <span>
-                      {image.source_file}
-                      {image.page_number ? ` · page ${image.page_number}` : ""}
-                    </span>
-                  </div>
-                </div>
-              ))
-            ) : (
-              <p className="placeholder-text">No image cards returned for this query.</p>
-            )}
-          </div>
-        </article>
+          {result?.enough_evidence && result.images.length ? (
+            <section className="primary-card media-panel">
+              <div className="card-header">
+                <p className="card-kicker">Relevant Images</p>
+                <span className="pill">{result.images.length}</span>
+              </div>
+              <div className="stack">
+                {result.images.map((image) => (
+                  <figure key={image.id} className="image-card">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={image.image_url} alt={image.caption || image.image_id} />
+                    <figcaption className="image-meta">
+                      <strong>{image.caption || image.id}</strong>
+                      <span>
+                        {image.source_file}
+                        {image.page_number ? ` · page ${image.page_number}` : ""}
+                      </span>
+                    </figcaption>
+                  </figure>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </aside>
       </section>
     </main>
   );
+}
+
+function TablePreview({ table }: { table: TableCard }) {
+  return (
+    <article className="table-card">
+      <div className="table-card-head">
+        <strong>{table.table_caption || table.id}</strong>
+        <span>
+          {table.source_file}
+          {table.page_numbers.length ? ` · p${table.page_numbers.join(", ")}` : ""}
+        </span>
+      </div>
+
+      {table.table_markdown ? (
+        <div className="markdown-table">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{table.table_markdown}</ReactMarkdown>
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function formatSeconds(value: number | undefined): string {
+  return `${Number(value || 0).toFixed(2)}s`;
+}
+
+function totalTime(timings: Record<string, number>): number {
+  return Number(timings.total_pre_llm_sec || 0) + Number(timings.llm_sec || 0);
 }
