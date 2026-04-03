@@ -203,7 +203,8 @@ class QdrantManager:
 
     def retrieve_points(self, *, collection: str, point_ids: Iterable[object]) -> list[dict]:
         collection_name = self._resolve_collection_name(collection)
-        normalized_ids = [self._normalize_point_id(point_id, kind=collection_name) for point_id in point_ids]
+        point_kind = "text" if collection_name == self.text_collection else "image"
+        normalized_ids = [self._normalize_point_id(point_id, kind=point_kind) for point_id in point_ids]
         if not normalized_ids:
             return []
         points = self.client.retrieve(
@@ -312,7 +313,7 @@ class QdrantManager:
 
     @staticmethod
     def _point_to_row(point) -> dict:
-        row = {"_score": point.score, "_id": point.id}
+        row = {"_score": float(getattr(point, "score", 0.0) or 0.0), "_id": point.id}
         row.update(point.payload)
         return row
 
