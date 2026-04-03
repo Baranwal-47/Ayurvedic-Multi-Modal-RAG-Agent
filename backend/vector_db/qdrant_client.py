@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
@@ -13,10 +14,12 @@ from qdrant_client.models import (
     Filter,
     Fusion,
     FusionQuery,
+    MatchAny,
     MatchValue,
     PayloadSchemaType,
     PointStruct,
     Prefetch,
+    Range,
     SparseIndexParams,
     SparseVector,
     SparseVectorParams,
@@ -136,10 +139,9 @@ class QdrantManager:
         sparse_indices: list[int],
         sparse_values: list[float],
         top_k: int = 10,
-        doc_id: str | None = None,
-        language: str | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict]:
-        query_filter = self._search_filter(doc_id=doc_id, language=language)
+        query_filter = self._search_filter(collection_name=self.text_collection, filters=filters)
         results = self.client.query_points(
             collection_name=self.text_collection,
             prefetch=[
@@ -153,8 +155,19 @@ class QdrantManager:
         )
         return [self._point_to_row(point) for point in results.points]
 
-    def search_images(self, *, dense_vector: list[float], top_k: int = 3, doc_id: str | None = None) -> list[dict]:
-        query_filter = self._search_filter(doc_id=doc_id)
+    def search_images(
+        self,
+        *,
+        dense_vector: list[float],
+        top_k: int = 3,
+        filters: dict[str, Any] | None = None,
+        exclude_image_types: Iterable[str] | None = None,
+    ) -> list[dict]:
+        query_filter = self._search_filter(
+            collection_name=self.image_collection,
+            filters=filters,
+            exclude_image_types=exclude_image_types,
+        )
         results = self.client.query_points(
             collection_name=self.image_collection,
             query=dense_vector,
@@ -164,6 +177,42 @@ class QdrantManager:
             with_payload=True,
         )
         return [self._point_to_row(point) for point in results.points]
+
+    def scroll_points(
+        self,
+        *,
+        collection: str,
+        filters: dict[str, Any] | None = None,
+        limit: int = 20,
+        exclude_image_types: Iterable[str] | None = None,
+    ) -> list[dict]:
+        collection_name = self._resolve_collection_name(collection)
+        query_filter = self._search_filter(
+            collection_name=collection_name,
+            filters=filters,
+            exclude_image_types=exclude_image_types,
+        )
+        points, _ = self.client.scroll(
+            collection_name=collection_name,
+            scroll_filter=query_filter,
+            limit=max(1, int(limit)),
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [self._point_to_row(point) for point in points]
+
+    def retrieve_points(self, *, collection: str, point_ids: Iterable[object]) -> list[dict]:
+        collection_name = self._resolve_collection_name(collection)
+        normalized_ids = [self._normalize_point_id(point_id, kind=collection_name) for point_id in point_ids]
+        if not normalized_ids:
+            return []
+        points = self.client.retrieve(
+            collection_name=collection_name,
+            ids=normalized_ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [self._point_to_row(point) for point in points]
 
     def delete_by_doc_id(self, doc_id: str, collection: str | None = None) -> int:
         return self._delete_by_filter(Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]), collection)
@@ -201,13 +250,65 @@ class QdrantManager:
                     continue
                 raise
 
-    def _search_filter(self, *, doc_id: str | None = None, language: str | None = None) -> Filter | None:
+    def _search_filter(
+        self,
+        *,
+        collection_name: str,
+        filters: dict[str, Any] | None = None,
+        exclude_image_types: Iterable[str] | None = None,
+    ) -> Filter | None:
+        filters = dict(filters or {})
         must: list[FieldCondition] = []
+        must_not: list[FieldCondition] = []
+
+        doc_id = self._clean_scalar(filters.get("doc_id"))
         if doc_id:
             must.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id)))
-        if language:
-            must.append(FieldCondition(key="languages", match=MatchValue(value=language)))
-        return Filter(must=must) if must else None
+
+        source_file = self._clean_scalar(filters.get("source_file"))
+        if source_file:
+            must.append(FieldCondition(key="source_file", match=MatchValue(value=source_file)))
+
+        languages = self._clean_list(filters.get("languages"))
+        if languages:
+            must.append(FieldCondition(key="languages", match=MatchAny(any=languages)))
+
+        scripts = self._clean_list(filters.get("scripts"))
+        if scripts:
+            must.append(FieldCondition(key="scripts", match=MatchAny(any=scripts)))
+
+        chunk_types = self._clean_list(filters.get("chunk_types"))
+        if chunk_types and collection_name == self.text_collection:
+            must.append(FieldCondition(key="chunk_type", match=MatchAny(any=chunk_types)))
+
+        image_types = self._clean_list(filters.get("image_types"))
+        if image_types and collection_name == self.image_collection:
+            must.append(FieldCondition(key="image_type", match=MatchAny(any=image_types)))
+
+        section_path = self._clean_list(filters.get("section_path"))
+        if section_path:
+            must.append(FieldCondition(key="section_path", match=MatchAny(any=section_path)))
+
+        page_start = self._clean_int(filters.get("page_start"))
+        page_end = self._clean_int(filters.get("page_end"))
+        if collection_name == self.text_collection:
+            if page_start is not None:
+                must.append(FieldCondition(key="page_end", range=Range(gte=page_start)))
+            if page_end is not None:
+                must.append(FieldCondition(key="page_start", range=Range(lte=page_end)))
+        else:
+            if page_start is not None:
+                must.append(FieldCondition(key="page_number", range=Range(gte=page_start)))
+            if page_end is not None:
+                must.append(FieldCondition(key="page_number", range=Range(lte=page_end)))
+
+        for image_type in self._clean_list(exclude_image_types):
+            if collection_name == self.image_collection:
+                must_not.append(FieldCondition(key="image_type", match=MatchValue(value=image_type)))
+
+        if not must and not must_not:
+            return None
+        return Filter(must=must or None, must_not=must_not or None)
 
     @staticmethod
     def _point_to_row(point) -> dict:
@@ -235,3 +336,33 @@ class QdrantManager:
             return str(uuid.UUID(raw))
         except Exception:
             return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{kind}:{raw}"))
+
+    @staticmethod
+    def _clean_scalar(value: object) -> str | None:
+        raw = str(value or "").strip()
+        return raw or None
+
+    @staticmethod
+    def _clean_list(values: object) -> list[str]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            cleaned = [values.strip()]
+        else:
+            cleaned = [str(value).strip() for value in values if str(value or "").strip()]
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in cleaned:
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+        return result
+
+    @staticmethod
+    def _clean_int(value: object) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
