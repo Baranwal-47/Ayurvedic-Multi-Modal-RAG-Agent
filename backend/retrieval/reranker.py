@@ -102,6 +102,9 @@ class CandidateReranker:
             },
         )
 
+    def prewarm(self) -> None:
+        self._load_model()
+
     def _score_pairs(self, query: str, candidates: list[RetrievalCandidate]) -> list[float]:
         model = self._load_model()
         pairs = [(query, candidate.rerank_text or candidate.snippet) for candidate in candidates]

@@ -1,5 +1,10 @@
 """End-to-end query orchestration for retrieval-backed answers."""
 
+# tests\query_debug.py --interactive --prewarm
+# query> what is palika yantra
+# query> show me the tlc figure
+# query> define rasa shastra
+
 from __future__ import annotations
 
 import os
@@ -134,6 +139,11 @@ class QueryEngine:
         self.context_builder = context_builder or ContextBuilder()
         self.llm_client = llm_client or self._default_llm_client()
 
+    def prewarm(self, *, load_reranker: bool = True) -> None:
+        self.text_embedder.embed(["warmup"])
+        if load_reranker:
+            self.reranker.prewarm()
+
     def query(
         self,
         *,
@@ -161,6 +171,44 @@ class QueryEngine:
         answer = self._generate_answer(prepared)
         response = self._build_response(prepared, answer=answer, include_debug=include_debug)
         return response
+
+    def debug_query(
+        self,
+        *,
+        query: str,
+        doc_id: str | None = None,
+        page_start: int | None = None,
+        page_end: int | None = None,
+        languages: list[str] | None = None,
+        scripts: list[str] | None = None,
+        chunk_types: list[str] | None = None,
+        source_file: str | None = None,
+    ) -> dict[str, Any]:
+        prepared = self._prepare_query(
+            query=query,
+            doc_id=doc_id,
+            page_start=page_start,
+            page_end=page_end,
+            languages=languages,
+            scripts=scripts,
+            chunk_types=chunk_types,
+            source_file=source_file,
+            include_debug=True,
+        )
+        return {
+            "query_bundle": asdict(prepared.query_bundle),
+            "retrieved_candidates": [self._serialize_candidate(candidate) for candidate in prepared.retrieval_result.candidates],
+            "reranked_candidates": [self._serialize_candidate(candidate) for candidate in prepared.evidence.reranked_candidates],
+            "final_context": {
+                "system_prompt": prepared.context_pack.system_prompt,
+                "user_prompt": prepared.context_pack.user_prompt,
+                "citations": prepared.context_pack.citations,
+                "images": prepared.context_pack.images,
+                "tables": prepared.context_pack.tables,
+                "enough_evidence": prepared.context_pack.enough_evidence,
+            },
+            "timings": dict(prepared.timings),
+        }
 
     def stream_query(
         self,
@@ -292,6 +340,26 @@ class QueryEngine:
                 "context": prepared.context_pack.debug,
             }
         return response
+
+    @staticmethod
+    def _serialize_candidate(candidate) -> dict[str, Any]:
+        return {
+            "id": candidate.candidate_id,
+            "kind": candidate.kind,
+            "score": candidate.score,
+            "doc_id": candidate.doc_id,
+            "source_file": candidate.source_file,
+            "page_numbers": list(candidate.page_numbers),
+            "chunk_type": candidate.chunk_type,
+            "image_type": candidate.image_type,
+            "section_path": list(candidate.section_path),
+            "snippet": candidate.snippet,
+            "retrieval_reasons": list(candidate.retrieval_reasons),
+            "linked_ids": list(candidate.linked_ids),
+            "table_markdown": candidate.table_markdown,
+            "caption": candidate.caption,
+            "image_url": candidate.image_url,
+        }
 
     @staticmethod
     def _default_llm_client() -> LLMClient:

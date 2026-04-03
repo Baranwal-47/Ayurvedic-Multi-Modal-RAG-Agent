@@ -1,101 +1,218 @@
-import Image from "next/image";
+"use client";
+
+import { FormEvent, useState } from "react";
+
+type Citation = {
+  id: string;
+  kind: string;
+  source_file: string;
+  page_numbers: number[];
+  section_path: string[];
+  snippet: string;
+};
+
+type ImageCard = {
+  id: string;
+  image_id: string;
+  page_number?: number | null;
+  caption: string;
+  labels: string[];
+  image_url: string;
+  source_file: string;
+};
+
+type QueryResponse = {
+  answer: string;
+  citations: Citation[];
+  images: ImageCard[];
+  tables: unknown[];
+  enough_evidence: boolean;
+  query_intent: string;
+  model: string;
+  timings: Record<string, number>;
+};
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+
+const SAMPLE_QUERIES = [
+  "What is Palika Yantra?",
+  "Show me the figure for thin-layer chromatography",
+  "Give me the definition of rasa shastra",
+];
 
 export default function Home() {
-  return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
+  const [query, setQuery] = useState(SAMPLE_QUERIES[0]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<QueryResponse | null>(null);
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setError("Enter a query first.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/query`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query: trimmed }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Request failed");
+      }
+
+      const data = (await response.json()) as QueryResponse;
+      setResult(data);
+    } catch (err) {
+      setResult(null);
+      setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="hero-panel">
+        <p className="eyebrow">Ayurveda Multimodal RAG</p>
+        <h1>Ask the backend and inspect the evidence it returns.</h1>
+        <p className="hero-copy">
+          This local frontend sends a simple <code>POST /query</code> request and renders the
+          answer, citations, and figure cards from the backend.
+        </p>
+
+        <form className="query-form" onSubmit={handleSubmit}>
+          <label className="query-label" htmlFor="query">
+            Query
+          </label>
+          <textarea
+            id="query"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Ask about a formulation, shloka, apparatus, figure, or procedure..."
+            rows={5}
+          />
+
+          <div className="query-actions">
+            <button type="submit" disabled={loading}>
+              {loading ? "Querying..." : "Send /query"}
+            </button>
+
+            <div className="chips">
+              {SAMPLE_QUERIES.map((sample) => (
+                <button
+                  key={sample}
+                  type="button"
+                  className="chip"
+                  onClick={() => setQuery(sample)}
+                >
+                  {sample}
+                </button>
+              ))}
+            </div>
+          </div>
+        </form>
+
+        <div className="status-row">
+          <span>API</span>
+          <code>{API_BASE_URL}</code>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+      </section>
+
+      <section className="results-grid">
+        <article className="result-card answer-card">
+          <div className="card-header">
+            <p className="card-kicker">Answer</p>
+            {result ? (
+              <span className={`pill ${result.enough_evidence ? "pill-good" : "pill-warn"}`}>
+                {result.enough_evidence ? "Grounded" : "Low evidence"}
+              </span>
+            ) : null}
+          </div>
+
+          {error ? <p className="error-text">{error}</p> : null}
+
+          {result ? (
+            <>
+              <p className="answer-text">{result.answer}</p>
+              <div className="meta-row">
+                <span>Intent: {result.query_intent}</span>
+                <span>Model: {result.model}</span>
+              </div>
+            </>
+          ) : (
+            <p className="placeholder-text">
+              Submit a query to render the answer and supporting evidence here.
+            </p>
+          )}
+        </article>
+
+        <article className="result-card">
+          <div className="card-header">
+            <p className="card-kicker">Citations</p>
+            <span className="pill">{result?.citations.length ?? 0}</span>
+          </div>
+
+          <div className="stack">
+            {result?.citations.length ? (
+              result.citations.map((citation) => (
+                <div key={citation.id} className="citation-item">
+                  <div className="citation-head">
+                    <strong>{citation.id}</strong>
+                    <span>
+                      {citation.source_file} · p{citation.page_numbers.join(", ")}
+                    </span>
+                  </div>
+                  {citation.section_path.length ? (
+                    <p className="section-path">{citation.section_path.join(" > ")}</p>
+                  ) : null}
+                  <p>{citation.snippet}</p>
+                </div>
+              ))
+            ) : (
+              <p className="placeholder-text">No citations yet.</p>
+            )}
+          </div>
+        </article>
+
+        <article className="result-card">
+          <div className="card-header">
+            <p className="card-kicker">Images</p>
+            <span className="pill">{result?.images.length ?? 0}</span>
+          </div>
+
+          <div className="stack">
+            {result?.images.length ? (
+              result.images.map((image) => (
+                <div key={image.id} className="image-card">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={image.image_url} alt={image.caption || image.image_id} />
+                  <div className="image-meta">
+                    <strong>{image.id}</strong>
+                    <p>{image.caption || "No caption available."}</p>
+                    <span>
+                      {image.source_file}
+                      {image.page_number ? ` · page ${image.page_number}` : ""}
+                    </span>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <p className="placeholder-text">No image cards returned for this query.</p>
+            )}
+          </div>
+        </article>
+      </section>
+    </main>
   );
 }

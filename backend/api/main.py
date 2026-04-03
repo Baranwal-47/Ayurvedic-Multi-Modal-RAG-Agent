@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette import EventSourceResponse
 
 from api.models import HealthResponse, QueryRequest, QueryResponse
@@ -13,6 +15,33 @@ from rag.query_engine import QueryEngine, llm_provider_name
 
 
 app = FastAPI(title="Ayurveda RAG API", version="0.1.0")
+
+
+def _cors_origins() -> list[str]:
+    raw = str(os.getenv("FRONTEND_ORIGINS", "") or "").strip()
+    if raw:
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def warm_query_engine() -> None:
+    if str(os.getenv("PREWARM_MODELS_ON_STARTUP", "false")).strip().lower() not in {"1", "true", "yes"}:
+        return
+    engine = get_query_engine()
+    engine.prewarm(load_reranker=True)
 
 
 @lru_cache(maxsize=1)
