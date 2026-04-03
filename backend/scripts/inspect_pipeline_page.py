@@ -47,6 +47,21 @@ def _stable_doc_id(pdf_path: Path) -> str:
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
+def _is_blank_like_page(*, native_text: str, classification) -> bool:
+    compact = " ".join(str(native_text or "").split()).strip()
+    if getattr(classification, "page_type", "") == "blank":
+        return True
+    if getattr(classification, "image_heavy", False):
+        return False
+    if not compact:
+        return True
+    if len(compact) <= 24 and not any(ch.isalpha() for ch in compact):
+        return True
+    if len(compact) <= 8 and len(compact.split()) <= 2:
+        return True
+    return False
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inspect rebuilt ingestion pipeline on selected pages")
     parser.add_argument("--pdf", type=Path, required=True, help="Path to PDF")
@@ -280,7 +295,11 @@ def main() -> int:
 
             route = "native"
             route_reason = "native_clean"
-            if not native_text.strip():
+            blank_like_page = _is_blank_like_page(native_text=native_text, classification=classification)
+            if blank_like_page:
+                route = "blank"
+                route_reason = "blank_page"
+            elif not native_text.strip():
                 route = "ocr"
                 route_reason = "empty_native"
             elif use_ocr:
@@ -350,28 +369,47 @@ def main() -> int:
             else:
                 ocr_units = list(ocr_result.get("text_units") or [])
                 effective_granularity = "paragraph"
-            if not ocr_units and native_page.text_units:
+            if not ocr_units and blank_like_page:
+                page_model = builder.build(
+                    doc_id=doc_id,
+                    source_file=pdf_path.name,
+                    page_number=page_number,
+                    route="blank",
+                    native_units=[],
+                )
+                quality = page_model.setdefault("quality", {})
+                quality["structure_engine"] = "none"
+                quality["route_reason"] = "blank_page"
+                quality["is_blank_page"] = True
+                quality["ocr_unit_granularity"] = "none"
+                quality["ocr_line_unit_count_raw"] = len(raw_line_units)
+                quality["ocr_unit_count_effective"] = 0
+            elif not ocr_units and native_page.text_units:
                 raise RuntimeError(f"OCR failed on page {page_number}")
-
-            ocr_route = classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback"
-            page_model = builder.build(
-                doc_id=doc_id,
-                source_file=pdf_path.name,
-                page_number=page_number,
-                route=ocr_route,
-                ocr_units=ocr_units,
-                ocr_confidence=ocr_result.get("confidence"),
-            )
-            quality = page_model.setdefault("quality", {})
-            quality["structure_engine"] = "vision"
-            quality["route_reason"] = route_reason
-            quality["ocr_unit_granularity"] = effective_granularity
-            quality["ocr_line_unit_count_raw"] = len(raw_line_units)
-            quality["ocr_unit_count_effective"] = len(ocr_units)
+            else:
+                ocr_route = classification.page_type if classification.page_type in {"scanned", "ocr_fallback"} else "ocr_fallback"
+                page_model = builder.build(
+                    doc_id=doc_id,
+                    source_file=pdf_path.name,
+                    page_number=page_number,
+                    route=ocr_route,
+                    ocr_units=ocr_units,
+                    ocr_confidence=ocr_result.get("confidence"),
+                )
+                quality = page_model.setdefault("quality", {})
+                quality["structure_engine"] = "vision"
+                quality["route_reason"] = route_reason
+                quality["ocr_unit_granularity"] = effective_granularity
+                quality["ocr_line_unit_count_raw"] = len(raw_line_units)
+                quality["ocr_unit_count_effective"] = len(ocr_units)
             docling_result = {"used": False, "reason": "route_ocr"}
         else:
             selected_units = native_page.text_units
             structure_engine = "pymupdf"
+
+            if route == "blank":
+                selected_units = []
+                structure_engine = "none"
 
             if route == "docling" and docling_ready:
                 try:
@@ -401,12 +439,13 @@ def main() -> int:
                 doc_id=doc_id,
                 source_file=pdf_path.name,
                 page_number=page_number,
-                route="digitized",
+                route="blank" if route == "blank" else "digitized",
                 native_units=selected_units,
             )
             quality = page_model.setdefault("quality", {})
             quality["structure_engine"] = structure_engine
             quality["route_reason"] = route_reason
+            quality["is_blank_page"] = route == "blank"
 
         page_model = layout.apply(page_model)
         page_model = shloka.apply(page_model)

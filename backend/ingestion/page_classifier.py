@@ -59,6 +59,8 @@ class PageClassifier:
 
         if len(native_text.strip()) < self.min_native_chars and image_heavy:
             return PageClassification(page_number, "scanned", "low_text_high_image", False, True)
+        if not native_text.strip() and not image_heavy:
+            return PageClassification(page_number, "blank", "blank_native", False, False)
         if native_text_ok:
             return PageClassification(page_number, "digitized", "native_good", True, image_heavy)
         if native_text.strip() and not image_heavy and self._looks_like_index_page(native_text):

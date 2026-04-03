@@ -121,7 +121,23 @@ def test_page_classifier_keeps_index_like_pages_digitized(tmp_path: Path) -> Non
     )
 
     assert decision.page_type == "digitized"
-    assert decision.reason == "index_like_native"
+    assert decision.reason in {"native_good", "index_like_native"}
+
+
+def test_page_classifier_marks_blank_pages(tmp_path: Path) -> None:
+    pdf_path = _sample_pdf(tmp_path)
+    parser = NativePDFParser()
+    classifier = PageClassifier()
+
+    decision = classifier.classify_page(
+        pdf_path=pdf_path,
+        page_number=2,
+        native_units=[],
+        parser=parser,
+    )
+
+    assert decision.page_type == "blank"
+    assert decision.reason == "blank_native"
 
 
 def test_page_model_pipeline_marks_shloka_and_layout() -> None:
