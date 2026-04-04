@@ -41,6 +41,16 @@ export default function DeveloperPage() {
   }
 
   const debug = result?.debug;
+  const retrievalTiming = debug?.retrieval_timing;
+  const retrievalCounts = debug?.retrieval_counts;
+  const rerankTiming = debug?.rerank_timing;
+  const rerankMeta = debug?.rerank_meta;
+  const route = String((debug?.query_bundle as Record<string, unknown> | undefined)?.route || "deep");
+  const rerankSkipped = Boolean((debug?.rerank as Record<string, unknown> | undefined)?.skipped);
+  const retrievalSlow = Number(result?.timings?.retrieval_sec || 0) > 1.0;
+  const rerankSlow = Number(result?.timings?.rerank_sec || 0) > 1.5;
+  const shouldShowWarmWarning = route === "deep" && !rerankSkipped;
+  const modelCold = shouldShowWarmWarning && rerankMeta?.warm_model === false;
 
   return (
     <main className="developer-shell">
@@ -110,9 +120,20 @@ export default function DeveloperPage() {
               <div className="meta-grid">
                 <span>Intent: {result.query_intent}</span>
                 <span>Model: {result.model}</span>
+                <span>Retrieval: {formatSeconds(result.timings.retrieval_sec)}</span>
+                <span>Rerank: {formatSeconds(result.timings.rerank_sec)}</span>
+                <span>Context: {formatSeconds(result.timings.context_sec)}</span>
                 <span>Pre-LLM: {formatSeconds(result.timings.total_pre_llm_sec)}</span>
                 <span>LLM: {formatSeconds(result.timings.llm_sec)}</span>
+                <span>Total: {formatSeconds(totalTime(result.timings))}</span>
               </div>
+              {retrievalSlow || rerankSlow || modelCold ? (
+                <div className="warning-badges">
+                  {retrievalSlow ? <span className="pill pill-warn">Retrieval &gt; 1.0s</span> : null}
+                  {rerankSlow ? <span className="pill pill-warn">Rerank &gt; 1.5s</span> : null}
+                  {modelCold ? <span className="pill pill-warn">Reranker not prewarmed</span> : null}
+                </div>
+              ) : null}
             </>
           ) : (
             <p className="placeholder-text">Run a query to populate the debug view.</p>
@@ -189,7 +210,56 @@ export default function DeveloperPage() {
 
         <article className="primary-card">
           <div className="card-header">
-            <p className="card-kicker">Debug Stats</p>
+            <p className="card-kicker">Stage Timings</p>
+            {retrievalSlow || rerankSlow || modelCold ? <span className="pill pill-warn">Hotspot detected</span> : null}
+          </div>
+          <pre className="debug-pre">
+            {JSON.stringify(
+              {
+                retrieval_sec: result?.timings.retrieval_sec ?? null,
+                rerank_sec: result?.timings.rerank_sec ?? null,
+                context_sec: result?.timings.context_sec ?? null,
+                total_pre_llm_sec: result?.timings.total_pre_llm_sec ?? null,
+                llm_sec: result?.timings.llm_sec ?? null,
+                total_sec: result ? totalTime(result.timings) : null,
+              },
+              null,
+              2,
+            )}
+          </pre>
+        </article>
+
+        <article className="primary-card">
+          <div className="card-header">
+            <p className="card-kicker">Retrieval Timing</p>
+          </div>
+          <pre className="debug-pre">{JSON.stringify(retrievalTiming || null, null, 2)}</pre>
+        </article>
+
+        <article className="primary-card">
+          <div className="card-header">
+            <p className="card-kicker">Retrieval Counts</p>
+          </div>
+          <pre className="debug-pre">{JSON.stringify(retrievalCounts || null, null, 2)}</pre>
+        </article>
+
+        <article className="primary-card">
+          <div className="card-header">
+            <p className="card-kicker">Rerank Timing</p>
+          </div>
+          <pre className="debug-pre">{JSON.stringify(rerankTiming || null, null, 2)}</pre>
+        </article>
+
+        <article className="primary-card">
+          <div className="card-header">
+            <p className="card-kicker">Rerank Meta</p>
+          </div>
+          <pre className="debug-pre">{JSON.stringify(rerankMeta || null, null, 2)}</pre>
+        </article>
+
+        <article className="primary-card">
+          <div className="card-header">
+            <p className="card-kicker">Debug Snapshot</p>
           </div>
           <pre className="debug-pre">
             {JSON.stringify(
@@ -246,4 +316,8 @@ function DebugColumn({ title, items }: { title: string; items: DebugCandidate[] 
 
 function formatSeconds(value: number | undefined): string {
   return `${Number(value || 0).toFixed(2)}s`;
+}
+
+function totalTime(timings: Record<string, number> | undefined): number {
+  return Number(timings?.total_pre_llm_sec || 0) + Number(timings?.llm_sec || 0);
 }

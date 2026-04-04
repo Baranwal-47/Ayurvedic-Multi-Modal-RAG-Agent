@@ -51,10 +51,47 @@ export type DebugCandidate = {
   image_url?: string | null;
 };
 
+export type RetrievalTiming = {
+  embed_query_sec?: number;
+  text_original_sec?: number;
+  text_normalized_sec?: number;
+  image_direct_sec?: number;
+  linked_image_rescue_sec?: number;
+  page_proximity_rescue_sec?: number;
+  hydrate_points_sec?: number;
+  merge_sort_sec?: number;
+};
+
+export type RetrievalCounts = {
+  text_hits_original?: number;
+  text_hits_normalized?: number;
+  image_hits_direct?: number;
+  rescued_image_hits?: number;
+  rescued_page_hits?: number;
+  candidate_count_merged?: number;
+};
+
+export type RerankTiming = {
+  pair_build_sec?: number;
+  model_infer_sec?: number;
+  postprocess_sec?: number;
+};
+
+export type RerankMeta = {
+  device?: string;
+  model?: string;
+  pool_size?: number;
+  warm_model?: boolean;
+};
+
 export type QueryDebug = {
   query_bundle?: Record<string, unknown>;
   retrieved_candidates?: DebugCandidate[];
   reranked_candidates?: DebugCandidate[];
+  retrieval_timing?: RetrievalTiming;
+  retrieval_counts?: RetrievalCounts;
+  rerank_timing?: RerankTiming;
+  rerank_meta?: RerankMeta;
   retrieval?: Record<string, unknown>;
   rerank?: Record<string, unknown>;
   context?: Record<string, unknown>;

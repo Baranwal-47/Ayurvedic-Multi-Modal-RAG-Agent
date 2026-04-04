@@ -35,6 +35,31 @@ body {
   font-family: var(--font-geist-sans), sans-serif;
 }
 
+.chat-scroll-region {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(140, 231, 185, 0.72) rgba(5, 8, 5, 0.38);
+}
+
+.chat-scroll-region::-webkit-scrollbar {
+  width: 14px;
+}
+
+.chat-scroll-region::-webkit-scrollbar-track {
+  background: linear-gradient(180deg, rgba(4, 7, 4, 0.18), rgba(6, 21, 10, 0.62));
+}
+
+.chat-scroll-region::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(197, 246, 220, 0.9), rgba(74, 222, 128, 0.7));
+  background-clip: padding-box;
+}
+
+.chat-scroll-region::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(228, 250, 238, 0.96), rgba(110, 231, 183, 0.82));
+  background-clip: padding-box;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -277,6 +302,13 @@ pre {
 
 .meta-grid {
   justify-content: flex-start;
+}
+
+.warning-badges {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .placeholder-text {
