@@ -39,6 +39,8 @@ class ContextBuilder:
         self.encoding = tiktoken.get_encoding("cl100k_base")
 
     def build(self, query_bundle: QueryBundle, evidence: EvidenceSelection) -> ContextPack:
+        top_candidate = evidence.reranked_candidates[0] if evidence.reranked_candidates else None
+        top_image_candidate_id = top_candidate.candidate_id if top_candidate and top_candidate.kind == "image" else None
         query_keywords = self._keywords(query_bundle.query)
         citation_candidates = [
             candidate
@@ -56,11 +58,10 @@ class ContextBuilder:
         image_cards: list[dict[str, Any]] = []
         for index, candidate in enumerate(evidence.image_candidates, start=1):
             card = self._make_image_card(
-                query_bundle,
                 candidate,
                 card_id=f"F{index}",
                 citation_id_map=citation_id_map,
-                query_keywords=query_keywords,
+                is_top_ranked=(candidate.candidate_id == top_image_candidate_id),
             )
             if card:
                 image_cards.append(card)
@@ -77,6 +78,7 @@ class ContextBuilder:
             citations=citations,
             images=image_cards,
             tables=table_cards,
+            top_chunk_kind=top_candidate.kind if top_candidate else "none",
         )
 
         debug = {
@@ -87,6 +89,8 @@ class ContextBuilder:
             "image_ids": [image["id"] for image in image_cards],
             "table_ids": [table["id"] for table in table_cards],
             "query_keywords": sorted(query_keywords),
+            "top_chunk_kind": top_candidate.kind if top_candidate else None,
+            "top_chunk_id": top_candidate.candidate_id if top_candidate else None,
         }
         return ContextPack(
             system_prompt=system_prompt,
@@ -105,16 +109,30 @@ class ContextBuilder:
         citations: list[dict[str, Any]],
         images: list[dict[str, Any]],
         tables: list[dict[str, Any]],
+        top_chunk_kind: str,
     ) -> tuple[str, str, dict[str, Any]]:
         system_prompt = (
-            "You answer questions using only the provided evidence.\n"
+            "You are an expert in Ayurvedic texts with deep knowledge of Sanskrit, Hindi, and English.\n"
+            "Use only the provided context to answer the question.\n"
             "Rules:\n"
-            "1. Cite factual claims with citation IDs like C1, C2.\n"
-            "2. Mention figures only if figure IDs like F1 exist.\n"
-            "3. Mention tables only if table IDs like T1 exist.\n"
-            "4. Preserve Sanskrit and other source scripts exactly as given.\n"
-            "5. If the evidence is insufficient, say so clearly instead of guessing.\n"
-            "6. Keep the answer concise but useful."
+            "1. Preserve original Sanskrit or Hindi wording EXACTLY when quoting. Never normalize diacritics in output. "
+            "Never transliterate Sanskrit into Roman script unless explicitly asked.\n"
+            "2. Provide clear explanations in the same language the question was asked.\n"
+            "3. Display Sanskrit shlokas wherever needed if they are present in the evidence.\n"
+            "4. If a procedure or list is present, format it as a Markdown table whenever that improves clarity.\n"
+            "5. If context mentions a diagram or illustration, reference it in your answer using the supplied "
+            "diagram token like [Diagram: ...].\n"
+            "6. Always end your answer with a source citation in the format [Book Title, p.X] or "
+            "[Book Title, Shloka X.Y] when verse numbering is available in the evidence.\n"
+            "7. Cite factual claims with the short evidence IDs like C1, C2 in the body when useful, but do not invent IDs.\n"
+            "8. If the answer is not in the context, say so clearly. Do not hallucinate.\n\n"
+            "Few-shot examples of correct Sanskrit preservation:\n"
+            "Q: What is Vata?\n"
+            "A: Vata (वात) is one of the three doshas. The classical definition is: वातः पित्तं कफश्चेति त्रयो दोषाः । "
+            "[Charaka Samhita, Sutra 1.57]\n\n"
+            "Q: Explain Agni in digestion.\n"
+            "A: Agni (अग्नि) refers to the digestive fire. The text states: जठराग्निः सर्वाग्नीनां मूलम् — meaning "
+            "Jatharagni is the root of all fires in the body. [Charaka Samhita, Chikitsa 15.3]"
         )
 
         sections: list[tuple[str, str]] = [
@@ -122,12 +140,16 @@ class ContextBuilder:
             ("Intent", query_bundle.intent),
         ]
 
+        image_text = "\n\n".join(self._format_image_prompt_block(image) for image in images)
         citation_text = "\n\n".join(self._format_citation_prompt_block(citation) for citation in citations)
+
+        if top_chunk_kind == "image" and image_text:
+            sections.append(("Figure Evidence", image_text))
+
         if citation_text:
             sections.append(("Text Evidence", citation_text))
 
-        image_text = "\n\n".join(self._format_image_prompt_block(image) for image in images)
-        if image_text:
+        if top_chunk_kind != "image" and image_text:
             sections.append(("Figure Evidence", image_text))
 
         table_text = "\n\n".join(self._format_table_prompt_block(table) for table in tables)
@@ -166,28 +188,30 @@ class ContextBuilder:
 
     def _make_image_card(
         self,
-        query_bundle: QueryBundle,
         candidate: RetrievalCandidate,
         *,
         card_id: str,
         citation_id_map: dict[str, str],
-        query_keywords: set[str],
+        is_top_ranked: bool,
     ) -> dict[str, Any] | None:
         if not candidate.image_url:
             return None
-        if not self._should_include_image(query_bundle, candidate, query_keywords):
-            return None
+        surrounding_text = str(candidate.text or "").strip()
+        caption = str(candidate.caption or "").strip()
         citation_ids = [citation_id_map[candidate_id] for candidate_id in candidate.linked_ids if candidate_id in citation_id_map]
         return {
             "id": card_id,
             "image_id": candidate.candidate_id,
             "page_number": candidate.page_numbers[0] if candidate.page_numbers else None,
-            "caption": candidate.caption or "",
+            "caption": caption,
+            "surrounding_text": surrounding_text,
+            "primary_text": surrounding_text or caption,
             "labels": list(candidate.labels),
             "image_url": candidate.image_url,
             "cloudinary_public_id": candidate.cloudinary_public_id,
             "source_file": candidate.source_file,
             "citation_ids": citation_ids,
+            "is_top_ranked": bool(is_top_ranked),
         }
 
     def _make_table_card(
@@ -232,6 +256,11 @@ class ContextBuilder:
         images: list[dict[str, Any]],
         tables: list[dict[str, Any]],
     ) -> bool:
+        if evidence.reranked_candidates and evidence.reranked_candidates[0].kind == "image":
+            top_image = evidence.reranked_candidates[0]
+            has_image_context = bool(str(top_image.text or "").strip() or str(top_image.caption or "").strip())
+            return bool(images) and has_image_context
+
         if citations:
             top_score = float(evidence.citation_candidates[0].score)
             if top_score >= 0.1:
@@ -239,6 +268,8 @@ class ContextBuilder:
         if query_bundle.is_visual:
             top_image_score = float(evidence.image_candidates[0].score) if evidence.image_candidates else -999.0
             return bool(images) and (bool(citations) or top_image_score >= 0.35)
+        if query_bundle.is_shloka:
+            return any(self._is_shloka_like_candidate(candidate) for candidate in evidence.citation_candidates) and bool(citations)
         if query_bundle.is_table:
             top_table_score = float(evidence.table_candidates[0].score) if evidence.table_candidates else -999.0
             return bool(tables) and (bool(citations) or top_table_score >= 0.2)
@@ -248,8 +279,11 @@ class ContextBuilder:
     def _format_citation_prompt_block(citation: dict[str, Any]) -> str:
         section = " > ".join(citation.get("section_path") or [])
         section_line = f"Section: {section}\n" if section else ""
+        source_label = ContextBuilder._display_source_title(citation.get("source_file"))
+        page_numbers = citation.get("page_numbers") or []
+        page_label = f"p.{page_numbers[0]}" if len(page_numbers) == 1 else f"pp.{', '.join(str(page) for page in page_numbers)}"
         return (
-            f"[{citation['id']}] Source: {citation['source_file']} p{citation['page_numbers']}\n"
+            f"[{citation['id']}] Source: {source_label}, {page_label}\n"
             f"{section_line}"
             f"{citation['snippet']}"
         ).strip()
@@ -259,9 +293,15 @@ class ContextBuilder:
         labels = ", ".join(image.get("labels") or [])
         labels_line = f"\nLabels: {labels}" if labels else ""
         citation_line = f"\nLinked citations: {', '.join(image.get('citation_ids') or [])}" if image.get("citation_ids") else ""
+        diagram_token = ContextBuilder._diagram_token(image)
+        surrounding_text = str(image.get("surrounding_text") or "").strip()
+        caption = str(image.get("caption") or "").strip()
+        primary_text = surrounding_text or caption
+        caption_line = f"\nCaption: {caption}" if caption else ""
         return (
             f"[{image['id']}] Source: {image['source_file']} page {image['page_number']}\n"
-            f"Caption: {image.get('caption') or ''}{labels_line}{citation_line}"
+            f"Primary context: {primary_text}{caption_line}\n"
+            f"Diagram token: {diagram_token}{labels_line}{citation_line}"
         ).strip()
 
     @staticmethod
@@ -291,6 +331,8 @@ class ContextBuilder:
         candidate: RetrievalCandidate,
         query_keywords: set[str],
     ) -> bool:
+        if query_bundle.is_shloka and self._is_shloka_like_candidate(candidate):
+            return candidate.score >= -0.15
         if candidate.score >= 0.45:
             return True
         overlap = self._keyword_overlap(query_keywords, candidate)
@@ -308,7 +350,7 @@ class ContextBuilder:
     ) -> bool:
         overlap = self._keyword_overlap(query_keywords, candidate)
         if query_bundle.is_visual:
-            return bool(overlap) or candidate.score >= 0.4 or bool(candidate.linked_ids)
+            return bool(overlap) or bool(candidate.linked_ids) or candidate.score >= 0.92
         return bool(overlap) and candidate.score >= 0.2
 
     def _keyword_overlap(self, query_keywords: set[str], candidate: RetrievalCandidate) -> set[str]:
@@ -318,6 +360,7 @@ class ContextBuilder:
             part
             for part in [
                 candidate.heading_text or "",
+                " ".join(candidate.section_path or []),
                 candidate.text or "",
                 candidate.caption or "",
                 " ".join(candidate.labels or []),
@@ -329,8 +372,50 @@ class ContextBuilder:
         return query_keywords.intersection(self._keywords(candidate_text))
 
     def _keywords(self, text: str) -> set[str]:
-        return {
-            token
-            for token in re.findall(r"\w+", str(text or "").lower())
-            if len(token) >= 3 and token not in self.STOPWORDS and not token.isdigit()
-        }
+        keywords: set[str] = set()
+        for token in re.findall(r"\w+", str(text or "").lower()):
+            if len(token) < 3 or token in self.STOPWORDS or token.isdigit():
+                continue
+            keywords.add(token)
+            if token.endswith("s") and len(token) >= 5:
+                keywords.add(token[:-1])
+            if token.endswith("es") and len(token) >= 6:
+                keywords.add(token[:-2])
+        return keywords
+
+    @staticmethod
+    def _is_shloka_like_candidate(candidate: RetrievalCandidate) -> bool:
+        payload = dict(candidate.payload or {})
+        text = str(candidate.text or candidate.snippet or "").strip()
+        scripts = {str(script) for script in payload.get("scripts", [])}
+
+        if candidate.chunk_type == "shloka":
+            return True
+        if bool(payload.get("is_shloka")) or payload.get("shloka_number"):
+            return True
+        if "Deva" in scripts and any(mark in text for mark in ("।", "॥", "|")):
+            return True
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return len(lines) >= 2 and all(len(line.split()) <= 16 for line in lines)
+
+    @staticmethod
+    def _display_source_title(source_file: object) -> str:
+        raw = str(source_file or "").strip()
+        if raw.lower().endswith(".pdf"):
+            return raw[:-4]
+        return raw or "Unknown Source"
+
+    @staticmethod
+    def _diagram_token(image: dict[str, Any]) -> str:
+        public_id = str(image.get("cloudinary_public_id") or "").strip()
+        image_id = str(image.get("image_id") or "").strip()
+        source_file = str(image.get("source_file") or "").strip()
+        page_number = image.get("page_number")
+        base = public_id.rsplit("/", 1)[-1] if public_id else image_id or source_file or "diagram"
+        if "." not in base:
+            base = f"{base}.png"
+        if page_number and "page" not in base.lower():
+            stem, dot, suffix = base.rpartition(".")
+            if dot:
+                base = f"{stem}_page{page_number}.{suffix}"
+        return f"[Diagram: {base}]"

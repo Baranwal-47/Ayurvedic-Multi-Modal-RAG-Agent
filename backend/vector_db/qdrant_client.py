@@ -141,6 +141,7 @@ class QdrantManager:
         sparse_values: list[float],
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
+        include_vectors: bool = False,
     ) -> list[dict]:
         query_filter = self._search_filter(collection_name=self.text_collection, filters=filters)
         results = self.client.query_points(
@@ -153,6 +154,27 @@ class QdrantManager:
             query_filter=query_filter,
             limit=top_k,
             with_payload=True,
+            with_vectors=["dense"] if include_vectors else False,
+        )
+        return [self._point_to_row(point) for point in results.points]
+
+    def search_text_dense(
+        self,
+        *,
+        dense_vector: list[float],
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+        include_vectors: bool = False,
+    ) -> list[dict]:
+        query_filter = self._search_filter(collection_name=self.text_collection, filters=filters)
+        results = self.client.query_points(
+            collection_name=self.text_collection,
+            query=dense_vector,
+            using="dense",
+            query_filter=query_filter,
+            limit=top_k,
+            with_payload=True,
+            with_vectors=["dense"] if include_vectors else False,
         )
         return [self._point_to_row(point) for point in results.points]
 
@@ -163,6 +185,7 @@ class QdrantManager:
         top_k: int = 3,
         filters: dict[str, Any] | None = None,
         exclude_image_types: Iterable[str] | None = None,
+        include_vectors: bool = False,
     ) -> list[dict]:
         query_filter = self._search_filter(
             collection_name=self.image_collection,
@@ -176,6 +199,7 @@ class QdrantManager:
             query_filter=query_filter,
             limit=top_k,
             with_payload=True,
+            with_vectors=["dense"] if include_vectors else False,
         )
         return [self._point_to_row(point) for point in results.points]
 
@@ -186,6 +210,7 @@ class QdrantManager:
         filters: dict[str, Any] | None = None,
         limit: int = 20,
         exclude_image_types: Iterable[str] | None = None,
+        include_vectors: bool = False,
     ) -> list[dict]:
         collection_name = self._resolve_collection_name(collection)
         query_filter = self._search_filter(
@@ -198,11 +223,11 @@ class QdrantManager:
             scroll_filter=query_filter,
             limit=max(1, int(limit)),
             with_payload=True,
-            with_vectors=False,
+            with_vectors=["dense"] if include_vectors else False,
         )
         return [self._point_to_row(point) for point in points]
 
-    def retrieve_points(self, *, collection: str, point_ids: Iterable[object]) -> list[dict]:
+    def retrieve_points(self, *, collection: str, point_ids: Iterable[object], include_vectors: bool = False) -> list[dict]:
         collection_name = self._resolve_collection_name(collection)
         point_kind = "text" if collection_name == self.text_collection else "image"
         normalized_ids = [self._normalize_point_id(point_id, kind=point_kind) for point_id in point_ids]
@@ -212,7 +237,7 @@ class QdrantManager:
             collection_name=collection_name,
             ids=normalized_ids,
             with_payload=True,
-            with_vectors=False,
+            with_vectors=["dense"] if include_vectors else False,
         )
         return [self._point_to_row(point) for point in points]
 
@@ -316,7 +341,30 @@ class QdrantManager:
     def _point_to_row(point) -> dict:
         row = {"_score": float(getattr(point, "score", 0.0) or 0.0), "_id": point.id}
         row.update(point.payload)
+        dense_vector = QdrantManager._extract_dense_vector(point)
+        if dense_vector:
+            row["_dense_vector"] = dense_vector
         return row
+
+    @staticmethod
+    def _extract_dense_vector(point) -> list[float] | None:
+        vector = getattr(point, "vector", None)
+        if vector is None:
+            return None
+
+        dense = None
+        if isinstance(vector, dict):
+            dense = vector.get("dense")
+        elif isinstance(vector, (list, tuple)):
+            dense = vector
+
+        if dense is None:
+            return None
+
+        try:
+            return [float(value) for value in dense]
+        except Exception:
+            return None
 
     def _resolve_collection_name(self, collection: str | None) -> str:
         name = str(collection or "").strip()

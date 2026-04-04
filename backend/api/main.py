@@ -38,7 +38,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def warm_query_engine() -> None:
-    if str(os.getenv("PREWARM_MODELS_ON_STARTUP", "false")).strip().lower() not in {"1", "true", "yes"}:
+    if str(os.getenv("PREWARM_MODELS_ON_STARTUP", "true")).strip().lower() not in {"1", "true", "yes"}:
         return
     engine = get_query_engine()
     engine.prewarm(load_reranker=True)

@@ -17,7 +17,7 @@ from groq import Groq
 
 from embeddings.text_embedder import TextEmbedder
 from rag.context_builder import ContextBuilder, ContextPack
-from retrieval.hybrid_search import HybridSearcher
+from retrieval.hybrid_search import HybridSearchResult, HybridSearcher
 from retrieval.reranker import CandidateReranker, EvidenceSelection
 from vector_db.qdrant_client import QdrantManager
 
@@ -82,7 +82,7 @@ class GroqLLMClient(LLMClient):
             raise RuntimeError("Groq API key is not configured")
         completion = self._client_instance().chat.completions.create(
             model=self._model_name,
-            temperature=0.2,
+            temperature=0,
             max_completion_tokens=600,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -97,7 +97,7 @@ class GroqLLMClient(LLMClient):
             raise RuntimeError("Groq API key is not configured")
         stream = self._client_instance().chat.completions.create(
             model=self._model_name,
-            temperature=0.2,
+            temperature=0,
             max_completion_tokens=600,
             stream=True,
             messages=[
@@ -281,13 +281,63 @@ class QueryEngine:
             include_debug=include_debug,
         )
 
+        if query_bundle.route == "simple":
+            context_pack = self._simple_context_pack(query_bundle.query)
+            rerank_meta = self._reranker_runtime_meta()
+            return QueryPreparation(
+                query_bundle=query_bundle,
+                retrieval_result=HybridSearchResult(
+                    query_bundle=query_bundle,
+                    candidates=[],
+                    debug={
+                        "route": "simple",
+                        "skipped_retrieval": True,
+                        "candidate_count_before_prefilter": 0,
+                        "candidate_count_after_prefilter": 0,
+                    },
+                ),
+                evidence=EvidenceSelection(
+                    reranked_candidates=[],
+                    citation_candidates=[],
+                    image_candidates=[],
+                    table_candidates=[],
+                    debug={
+                        "model": self.reranker.model_name,
+                        "pool_size": 0,
+                        "rerank_pool_size": 0,
+                        "reranker_infer_time": 0.0,
+                        "candidate_count_before_prefilter": 0,
+                        "candidate_count_after_prefilter": 0,
+                        "rerank_timing": {
+                            "pair_build_sec": 0.0,
+                            "model_infer_sec": 0.0,
+                            "postprocess_sec": 0.0,
+                        },
+                        "rerank_meta": rerank_meta,
+                        "skipped": True,
+                        "reason": "simple_route",
+                    },
+                ),
+                context_pack=context_pack,
+                timings={
+                    "retrieval_sec": 0.0,
+                    "rerank_sec": 0.0,
+                    "context_sec": 0.0,
+                    "total_pre_llm_sec": round(time.perf_counter() - started, 4),
+                },
+            )
+
         retrieval_started = time.perf_counter()
         retrieval_result = self.searcher.search(query_bundle)
         retrieval_sec = time.perf_counter() - retrieval_started
 
-        rerank_started = time.perf_counter()
-        evidence = self.reranker.rerank(query_bundle, retrieval_result.candidates)
-        rerank_sec = time.perf_counter() - rerank_started
+        rerank_sec = 0.0
+        if query_bundle.route == "fast":
+            evidence = self._fast_route_evidence(query_bundle, retrieval_result.candidates)
+        else:
+            rerank_started = time.perf_counter()
+            evidence = self.reranker.rerank(query_bundle, retrieval_result.candidates)
+            rerank_sec = time.perf_counter() - rerank_started
 
         context_started = time.perf_counter()
         context_pack = self.context_builder.build(query_bundle, evidence)
@@ -307,6 +357,9 @@ class QueryEngine:
         )
 
     def _generate_answer(self, prepared: QueryPreparation) -> str:
+        if getattr(prepared.query_bundle, "route", "deep") == "simple" and not self.llm_client.available():
+            return "Hello! How can I help you?"
+
         if not prepared.context_pack.enough_evidence:
             return "I couldn't find enough reliable evidence in the indexed material to answer confidently. Please refine the question or narrow the source scope."
 
@@ -327,10 +380,25 @@ class QueryEngine:
         citations = prepared.context_pack.citations if prepared.context_pack.enough_evidence else []
         images = prepared.context_pack.images if prepared.context_pack.enough_evidence else []
         tables = prepared.context_pack.tables if prepared.context_pack.enough_evidence else []
+        retrieval_timing = dict(prepared.retrieval_result.debug.get("retrieval_timing", {}) or {})
+        retrieval_counts = dict(prepared.retrieval_result.debug.get("retrieval_counts", {}) or {})
+        rerank_timing = dict(prepared.evidence.debug.get("rerank_timing", {}) or {})
+        rerank_meta = dict(prepared.evidence.debug.get("rerank_meta", {}) or {})
+        candidate_count_before_prefilter = prepared.retrieval_result.debug.get(
+            "candidate_count_before_prefilter",
+            prepared.evidence.debug.get("candidate_count_before_prefilter", 0),
+        )
+        candidate_count_after_prefilter = prepared.retrieval_result.debug.get(
+            "candidate_count_after_prefilter",
+            prepared.evidence.debug.get("candidate_count_after_prefilter", 0),
+        )
+        rerank_pool_size = prepared.evidence.debug.get("rerank_pool_size", prepared.evidence.debug.get("pool_size", 0))
+        reranker_infer_time = prepared.evidence.debug.get("reranker_infer_time", rerank_timing.get("model_infer_sec", 0.0))
+        public_images = [self._public_image_card(image) for image in images]
         response = {
             "answer": answer,
             "citations": citations,
-            "images": images,
+            "images": public_images,
             "tables": tables,
             "enough_evidence": prepared.context_pack.enough_evidence,
             "query_intent": prepared.query_bundle.intent,
@@ -342,6 +410,14 @@ class QueryEngine:
                 "query_bundle": asdict(prepared.query_bundle),
                 "retrieved_candidates": [self._serialize_candidate(candidate) for candidate in prepared.retrieval_result.candidates],
                 "reranked_candidates": [self._serialize_candidate(candidate) for candidate in prepared.evidence.reranked_candidates],
+                "retrieval_timing": retrieval_timing,
+                "retrieval_counts": retrieval_counts,
+                "rerank_timing": rerank_timing,
+                "rerank_meta": rerank_meta,
+                "candidate_count_before_prefilter": candidate_count_before_prefilter,
+                "candidate_count_after_prefilter": candidate_count_after_prefilter,
+                "rerank_pool_size": rerank_pool_size,
+                "reranker_infer_time": reranker_infer_time,
                 "retrieval": prepared.retrieval_result.debug,
                 "rerank": prepared.evidence.debug,
                 "context": prepared.context_pack.debug,
@@ -354,6 +430,85 @@ class QueryEngine:
                 },
             }
         return response
+
+    def _simple_context_pack(self, query: str) -> ContextPack:
+        return ContextPack(
+            system_prompt=(
+                "You are a concise, polite assistant. Respond naturally to greetings and small talk."
+            ),
+            user_prompt=str(query or "").strip(),
+            citations=[],
+            images=[],
+            tables=[],
+            enough_evidence=True,
+            debug={"route": "simple", "skipped_retrieval": True, "skipped_rerank": True},
+        )
+
+    def _fast_route_evidence(self, query_bundle, candidates: list) -> EvidenceSelection:
+        ranked = sorted(candidates, key=lambda item: (-item.score, item.candidate_id))
+        citation_candidates = [candidate for candidate in ranked if candidate.kind == "text"][:6]
+        image_candidates = [candidate for candidate in ranked if candidate.kind == "image" and candidate.image_url][:2]
+        table_candidates = [candidate for candidate in ranked if candidate.kind == "text" and candidate.is_table][:2]
+        rerank_meta = self._reranker_runtime_meta()
+
+        return EvidenceSelection(
+            reranked_candidates=ranked,
+            citation_candidates=citation_candidates,
+            image_candidates=image_candidates,
+            table_candidates=table_candidates,
+            debug={
+                "model": "none",
+                "pool_size": 0,
+                "rerank_pool_size": 0,
+                "reranker_infer_time": 0.0,
+                "candidate_count_before_prefilter": len(candidates),
+                "candidate_count_after_prefilter": len(candidates),
+                "rerank_timing": {
+                    "pair_build_sec": 0.0,
+                    "model_infer_sec": 0.0,
+                    "postprocess_sec": 0.0,
+                },
+                "rerank_meta": rerank_meta,
+                "skipped": True,
+                "reason": f"{query_bundle.route}_route",
+                "citation_ids": [candidate.candidate_id for candidate in citation_candidates],
+                "image_ids": [candidate.candidate_id for candidate in image_candidates],
+                "table_ids": [candidate.candidate_id for candidate in table_candidates],
+            },
+        )
+
+    def _reranker_runtime_meta(self) -> dict[str, Any]:
+        runtime_meta_fn = getattr(self.reranker, "runtime_meta", None)
+        if callable(runtime_meta_fn):
+            try:
+                meta = dict(runtime_meta_fn() or {})
+                if meta:
+                    return meta
+            except Exception:
+                pass
+
+        model_name = str(getattr(self.reranker, "model_name", "unknown") or "unknown")
+        model_obj = getattr(self.reranker, "_model", None)
+        return {
+            "model": model_name,
+            "device": "unknown" if model_obj is not None else "unloaded",
+            "pool_size": 0,
+            "warm_model": bool(model_obj is not None),
+        }
+
+    @staticmethod
+    def _public_image_card(image: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": image.get("id"),
+            "image_id": image.get("image_id"),
+            "page_number": image.get("page_number"),
+            "caption": image.get("caption") or "",
+            "labels": list(image.get("labels") or []),
+            "image_url": image.get("image_url"),
+            "cloudinary_public_id": image.get("cloudinary_public_id"),
+            "source_file": image.get("source_file"),
+            "citation_ids": list(image.get("citation_ids") or []),
+        }
 
     @staticmethod
     def _serialize_candidate(candidate) -> dict[str, Any]:
