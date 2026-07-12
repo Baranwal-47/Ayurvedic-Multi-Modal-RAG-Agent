@@ -24,3 +24,5 @@ FINAL_PLAN.md.pdf
 copilot_handoff.md
 debug.log
 backend/scripts/pdf_run_order_example.txt
+graphify-out
+.playwright-mcp/
