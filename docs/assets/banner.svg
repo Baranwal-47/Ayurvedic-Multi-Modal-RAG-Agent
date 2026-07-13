@@ -1,0 +1,58 @@
+<svg width="880" height="200" viewBox="0 0 880 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ayurveda Multimodal RAG banner">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="55%" stop-color="#10161f"/>
+      <stop offset="100%" stop-color="#151b12"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#e8a33d"/>
+      <stop offset="50%" stop-color="#d97742"/>
+      <stop offset="100%" stop-color="#7fb069"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7fb069"/>
+      <stop offset="100%" stop-color="#3d6b35"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="880" height="200" fill="url(#bg)"/>
+
+  <!-- faint devanagari watermark -->
+  <text x="855" y="180" text-anchor="end" font-family="'Noto Sans Devanagari','Nirmala UI',sans-serif"
+        font-size="72" fill="#e8a33d" opacity="0.08">आयुर्वेद</text>
+
+  <!-- leaf motif -->
+  <g transform="translate(766,36) rotate(18)">
+    <path d="M30 0 C 58 22, 62 62, 30 96 C -2 62, 2 22, 30 0 Z" fill="url(#leaf)" opacity="0.85"/>
+    <path d="M30 8 L30 88" stroke="#0d1117" stroke-width="2.4" opacity="0.55"/>
+    <path d="M30 26 L14 40 M30 26 L46 40 M30 46 L12 62 M30 46 L48 62 M30 66 L16 80 M30 66 L44 80"
+          stroke="#0d1117" stroke-width="1.8" opacity="0.45" fill="none"/>
+  </g>
+
+  <!-- accent rule -->
+  <rect x="48" y="52" width="56" height="5" rx="2.5" fill="url(#accent)"/>
+
+  <!-- title -->
+  <text x="48" y="98" font-family="'Segoe UI',system-ui,sans-serif" font-size="38" font-weight="700" fill="#e6edf3">
+    Ayurveda Multimodal RAG
+  </text>
+
+  <!-- tagline -->
+  <text x="48" y="128" font-family="'Segoe UI',system-ui,sans-serif" font-size="16" fill="#9aa4b2">
+    Grounded, cited answers from 9,676 pages of scanned Ayurvedic texts — shlokas, tables &amp; diagrams included
+  </text>
+
+  <!-- pipeline flow -->
+  <g font-family="'Cascadia Mono','Consolas',monospace" font-size="13">
+    <text x="48" y="162" fill="#e8a33d">PDF</text>
+    <text x="80" y="162" fill="#525b68">→</text>
+    <text x="98" y="162" fill="#d97742">OCR + OpenCV figures</text>
+    <text x="262" y="162" fill="#525b68">→</text>
+    <text x="280" y="162" fill="#79c0ff">Qdrant hybrid search</text>
+    <text x="440" y="162" fill="#525b68">→</text>
+    <text x="458" y="162" fill="#d2a8ff">cross-encoder rerank</text>
+    <text x="618" y="162" fill="#525b68">→</text>
+    <text x="636" y="162" fill="#7fb069">streamed, cited answer</text>
+  </g>
+</svg>
