@@ -7,6 +7,21 @@ original figure when a question is visual.
 
 ![Demo walkthrough](docs/assets/demo.gif)
 
+## By the numbers
+
+Pulled directly from the current Qdrant collections and ingestion run state — not estimates:
+
+| | |
+|---|---|
+| **Source PDFs ingested** | 80 |
+| **Pages processed** | 9,676 |
+| **Page failures** | 0 (100% of pages completed across all 80 documents) |
+| **Text chunks indexed** | 58,083 |
+| **Sanskrit shlokas isolated as dedicated chunks** | 3,591 |
+| **Table-text chunks** | 19,720 |
+| **Cross-page "bridge" chunks** (continuity across page breaks) | 2,544 |
+| **Diagrams / figures indexed** | 1,134 (1,111 diagrams, 23 tables) |
+
 ## Why this exists
 
 Real Ayurveda literature is not clean text. A single PDF can mix native digital text, scanned
